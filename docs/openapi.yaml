@@ -1,0 +1,2858 @@
+# NectarPush (蜂鸟推送) API Contract
+openapi: 3.1.0
+
+info:
+  title: NectarPush API
+  version: 1.0.0
+  summary: 自托管多渠道消息推送服务
+  description: |
+    NectarPush（蜂鸟推送）统一的 HTTP 接口定义（以此为准）。
+
+    **通道类型（16 类）**：core 10 类 = `email` / `telegram` / `discord` / `ding`（钉钉群机器人）/
+    `lark`（飞书群机器人） / `bark` / `custom` / `client`（WebSocket 客户端） / `group` / `none`；
+    另有 6 类占位通道（`status: draft`）：`test`（微信测试号） / `corp_app`（企微应用号） /
+    `corp`（企微群机器人） / `lark_app`（飞书自建应用） / `one_bot`（QQ/OneBot 协议，不用 `one_api`） /
+    `tencent_alarm`（腾讯云告警）。
+
+    **统一的响应格式**：成功 `{ "success": true, "data": … }`；失败 `{ "success": false, "message": "…", "code": "…" }`。
+    HTTP 状态码语义保留（401 鉴权失败 / 403 无权 / 404 不存在 / 422 校验失败 / 429 限流）。
+
+    **鉴权两级**：
+    - Web 控制台 API（`/api/**`）：会话 Cookie（`cookieAuth`）或 `Authorization: Bearer <用户全局令牌>`（`bearerAuth`）。
+    - 推送出口（`/push/{username}`、`POST /webhook/{name}`）：推送令牌有两种：用户全局令牌或目标通道令牌，
+      任一设置即必须匹配；令牌可放 query `?token=`、请求体或 `Authorization: Bearer`。Webhook 触发免令牌。
+
+    **范围声明**：通用 OAuth2 授权码登录（GitHub 预设 + 自定义 Provider），不做微信 OAuth；不做附件/文件上传；
+    用户注销为软删除并匿名化；首次启动内置 `root/123456`，root 首次登录强制改密（`mustChangePassword`）。
+
+    **强制改密**：`mustChangePassword=true` 的会话访问除 `PATCH /api/me`（自助改密）与
+    `POST /api/auth/logout`（登出）以外的受保护接口（`/api/**` 会话鉴权路由）一律返回
+    `403 PASSWORD_CHANGE_REQUIRED`；改密成功后自动恢复。
+
+    **异步与实时**：`async=true` 立即返回 `uuid`，经 `GET /api/messages/{uuid}/status`（公开）查询；
+    消息正文分享经 `GET /api/messages/{uuid}`（公开，不含 deliveries 与 ownerId，正文为原始内容由前端 DOMPurify 清洗）；
+    SSE `GET /api/events`（事件 `message.created` / `delivery.updated`，仅推送本人消息的事件，按 userId 隔离）；
+    WebSocket 客户端通道 `GET /ws/client`（协议见 docs/API.md）。
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://127.0.0.1:3000
+    description: 本地开发
+
+tags:
+  - name: push
+    description: 对外统一推送出口（GET|POST /push/{username}）与版本化别名。
+  - name: auth
+    description: 注册、登录、登出、找回/重置密码、邮箱验证码与通用 OAuth2 授权登录。
+  - name: channels
+    description: 通道增删改查、测试发送与通道类型清单（驱动前端动态表单）。
+  - name: messages
+    description: 消息列表/详情/发送/编辑（pending/failed）/重发/删除、异步状态查询与公开正文分享。
+  - name: webhooks
+    description: Webhook 增删改查与外部触发入口（由外部事件触发推送）。
+  - name: users
+    description: 管理员用户管理（含角色层级约束、用户动作与软删恢复）。
+  - name: options
+    description: 系统设置（admin/root 读写，敏感项不返回明文）。
+  - name: me
+    description: 当前用户资料、令牌与推送设置。
+  - name: realtime
+    description: SSE 事件流（/api/events，事件按登录用户隔离）。WebSocket 客户端通道 /ws/client 为升级端点，不属 REST，协议（握手鉴权、旧连接被断开、ping/pong、下行帧）以说明形式登记于本节与 docs/API.md「WebSocket 客户端通道」。
+  - name: public
+    description: 公开信息（关于、公告、页脚、Turnstile SiteKey、健康检查、版本）。
+
+security:
+  - cookieAuth: []
+  - bearerAuth: []
+
+paths:
+  /push/{username}:
+    get:
+      tags: [push]
+      operationId: pushGet
+      summary: 以查询参数推送（Server酱风格）
+      description: |
+        以 GET query 推送一条消息到 `{username}` 的指定（或默认）通道。
+        令牌有两种：用户全局令牌或目标通道令牌，任一设置即必须匹配；令牌可放 query `token` 或 `Authorization: Bearer`。
+        字段别名：`short`→`description`、`desp`→`content`、`openid`→`to`。
+        `to=@all` 广播全部启用通道；`to=a|b` 多目标。`async=true` 需消息持久化权限。
+        **收件人语义**：当目标通道（`channel` 参数→用户默认通道→`email`）解析为
+        **email 通道**且 `to` 为邮箱地址时，`to` 作为**收件人**（overrideTo），通道选择即该 email 通道；
+        其余情况 `to` 保持通道选择器语义。向**非本人绑定邮箱**发信须用户具备
+        `allowSendEmailToOthers` 授权（管理员经用户管理授予），否则发送前拒绝 403 `FORBIDDEN`；
+        获授权者向他人发信另受更严限流（每用户 10 次/3 分钟，超出 429 `RATE_LIMITED`），
+        且服务端审计日志记录发送者/收件人/通道/时间。
+      security:
+        - bearerAuth: []
+        - pushTokenQuery: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/UsernamePath'
+        - { name: title, in: query, description: 标题；缺省用系统名。, schema: { type: string, maxLength: 512 }, example: 部署完成 }
+        - { name: description, in: query, description: 描述/纯文本正文；别名 short。, schema: { type: string }, example: 服务已重启 }
+        - { name: short, in: query, description: description 的兼容别名（description 为空时生效）。, schema: { type: string } }
+        - { name: content, in: query, description: 长文/Markdown 源；别名 desp。, schema: { type: string }, example: '# 详情…' }
+        - { name: desp, in: query, description: content 的兼容别名（content 为空时生效）。, schema: { type: string } }
+        - { name: url, in: query, description: 点击跳转链接。, schema: { type: string, format: uri }, example: 'https://example.com/log' }
+        - { name: channel, in: query, description: 目标通道名；缺省用户默认通道，再缺省 email。, schema: { type: string, maxLength: 20 }, example: telegram }
+        - { name: token, in: query, description: 鉴权令牌（两种令牌的用法见端点说明）。, schema: { type: string }, example: d1c0ffee1234567890abcdef12345678 }
+        - { name: to, in: query, description: '通道选择器：@all 广播 / a|b 多目标 / 通道名；别名 openid。特例：目标通道为 email 且值为邮箱地址时作为收件人，发他人邮箱须 allowSendEmailToOthers 授权（否则 403）。', schema: { type: string, maxLength: 256 }, example: '@all' }
+        - { name: openid, in: query, description: to 的兼容别名（to 为空时生效）。, schema: { type: string } }
+        - { name: async, in: query, description: 为字符串 "true" 时异步发送（立即返回 uuid）。, schema: { type: string, enum: ['true', 'false'] }, example: 'false' }
+        - { name: render_mode, in: query, description: 渲染模式，缺省 markdown。, schema: { $ref: '#/components/schemas/RenderMode' }, example: markdown }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 推送结果（响应里的 success 表示业务成败；鉴权失败为 401）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushResultEnvelope' }
+              example:
+                success: true
+                message: ''
+                data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+    post:
+      tags: [push]
+      operationId: pushPost
+      summary: 以 JSON 或表单体推送
+      description: |
+        以 `application/json` 或 `application/x-www-form-urlencoded` 推送。
+        body 缺 `token` 时可从 query `?token=` 补。字段语义与别名同 GET。
+      security:
+        - bearerAuth: []
+        - pushTokenQuery: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/UsernamePath'
+        - { name: token, in: query, description: body 缺 token 时可从 query 补。, schema: { type: string } }
+        - { name: async, in: query, description: body 缺 async 时可从 query 补（"true" 生效）。, schema: { type: string, enum: ['true', 'false'] } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushRequestBody' }
+            example:
+              title: 构建失败
+              description: main 分支构建失败
+              content: '# 构建日志\n```text\nexit 1\n```'
+              url: 'https://ci.example.com/run/1024'
+              channel: ding
+              token: d1c0ffee1234567890abcdef12345678
+              to: '@all'
+              async: 'true'
+              render_mode: markdown
+          application/x-www-form-urlencoded:
+            schema: { $ref: '#/components/schemas/PushRequestBody' }
+            example:
+              title: 构建失败
+              desp: '# 构建日志'
+              openid: '@all'
+              token: d1c0ffee1234567890abcdef12345678
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 推送结果。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushResultEnvelope' }
+              example:
+                success: true
+                message: ''
+                data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/v1/push/{username}:
+    post:
+      tags: [push]
+      operationId: pushPostV1
+      summary: 版本化推送别名（等价 POST /push/{username}）
+      description: 行为与 `POST /push/{username}` 完全一致，仅路径版本化。
+      security:
+        - bearerAuth: []
+        - pushTokenQuery: []
+        - {}
+      parameters:
+        - $ref: '#/components/parameters/UsernamePath'
+        - { name: token, in: query, description: body 缺 token 时可从 query 补。, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushRequestBody' }
+            example: { title: 别名路径, description: v1, channel: none }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 推送结果。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushResultEnvelope' }
+              example: { success: true, message: '', data: { uuid: 0a1b2c3d4e5f60718293a4b5c6d7e8f9 } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/auth/register:
+    post:
+      tags: [auth]
+      operationId: register
+      summary: 用户名密码注册
+      description: 受「允许注册/允许密码注册/邮箱验证」开关与 Turnstile、临界限流约束。用户名 ≤12 唯一；密码 8–20 位。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterRequest' }
+            example:
+              username: hope
+              password: 'h0pe!pass42'
+              display_name: Hope
+              email: hope@example.com
+              verification_code: '884213'
+              turnstile_token: XXX.DUMMY.TOKEN
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 注册结果（失败也返回 200 的响应格式或 422，见错误码）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 注册成功 }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: 密码登录（建立会话 Cookie）
+      description: 成功后设置 HttpOnly 会话 Cookie 并返回精简用户信息；root 首次登录返回 `mustChangePassword=true`（未改密前前端会强制跳转到改密页）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LoginRequest' }
+            example: { username: hope, password: 'h0pe!pass42' }
+      responses:
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 登录成功；Set-Cookie 会话。
+          headers:
+            Set-Cookie:
+              description: 会话 Cookie（HttpOnly；SameSite=Lax）。
+              schema: { type: string, example: np_session=eyJhbGciOi...; Path=/; HttpOnly; SameSite=Lax }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LoginResultEnvelope' }
+              example:
+                success: true
+                data:
+                  user:
+                    id: 2
+                    username: hope
+                    display_name: Hope
+                    role: user
+                    status: active
+                    email: hope@example.com
+                    default_channel: email
+                    permissions: { send_email_to_others: false, save_message: true }
+                    created_at: '2026-11-01T09:30:00Z'
+                  must_change_password: false
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: 登出并清除会话
+      description: 可重复调用：未登录调用同样返回 200（无会话可清）并清除可能存在的 Cookie。
+      security: []
+      responses:
+        '200':
+          description: 登出成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 已登出 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/auth/verification:
+    post:
+      tags: [auth]
+      operationId: sendVerificationCode
+      summary: 发送邮箱验证码（注册/绑定用）
+      description: 临界限流 + 可选 Turnstile；验证码有有效期。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailOnlyRequest' }
+            example: { email: hope@example.com, turnstile_token: XXX.DUMMY.TOKEN }
+      responses:
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 发送结果。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 验证码已发送 }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/auth/reset-request:
+    post:
+      tags: [auth]
+      operationId: requestPasswordReset
+      summary: 请求找回密码邮件
+      description: 向邮箱发送含一次性 token 的重置链接；未注册邮箱不泄露存在性（统一提示）。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailOnlyRequest' }
+            example: { email: hope@example.com }
+      responses:
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 统一成功提示。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 若邮箱已注册，重置邮件已发送 }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/auth/reset-confirm:
+    post:
+      tags: [auth]
+      operationId: confirmPasswordReset
+      summary: 凭邮件 token 重置密码（用户自设新密码）
+      description: 校验通过后设置用户自设的新密码（强度对齐注册 8–20 位，两次输入须一致）；响应只回成功、不返回任何明文密码；旧密码与旧会话失效，token 一次性。
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResetConfirmRequest' }
+            example: { email: hope@example.com, token: 5c1f9a77b2e34d08, new_password: my-new-pass-42, new_password_confirm: my-new-pass-42 }
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 重置成功（不返回明文密码）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ResetConfirmResultEnvelope' }
+              example:
+                success: true
+                message: 密码已重置
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/auth/oauth/providers:
+    get:
+      tags: [auth]
+      operationId: listOAuthProviders
+      summary: 可用的 OAuth2 登录提供方（公开）
+      description: 仅返回 id 与显示名，供登录页动态渲染第三方登录按钮；不暴露 client_id/secret。
+      security: []
+      responses:
+        '200':
+          description: 提供方列表；未配置时为空数组。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthProviderListEnvelope' }
+              example:
+                success: true
+                data:
+                  items:
+                    - { id: github, display_name: GitHub }
+                    - { id: authentik, display_name: Leunghope SSO }
+
+  /api/auth/oauth/{provider}/start:
+    get:
+      tags: [auth]
+      operationId: oauthStart
+      summary: 发起 OAuth2 授权码跳转
+      description: |
+        302 跳转到 Provider 授权页。`provider` 取值：内置预设 `github`，或管理员配置的自定义 Provider 标识（Option `OAuth2Providers`）。
+        未配置/未启用的 Provider 返回 403。**不做微信 OAuth**。
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, description: Provider 标识（github 或自定义）。, schema: { type: string, maxLength: 32 }, example: github }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '302':
+          description: 重定向到 Provider 授权页。
+          headers:
+            Location:
+              description: Provider 授权 URL。
+              schema: { type: string, format: uri, example: 'https://github.com/login/oauth/authorize?client_id=...&state=...' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/auth/oauth/{provider}/callback:
+    get:
+      tags: [auth]
+      operationId: oauthCallback
+      summary: 通用 OAuth2 授权码回调
+      description: |
+        用 `code` 换 token、拉取 userinfo、按字段映射建立或绑定账号并创建会话；首次授权可自动建号。
+        成功 302 到前端工作台（Set-Cookie），失败 302 到前端错误页（带 `?error=`）。
+      security: []
+      parameters:
+        - { name: provider, in: path, required: true, description: Provider 标识。, schema: { type: string, maxLength: 32 }, example: github }
+        - { name: code, in: query, required: true, description: 授权码。, schema: { type: string }, example: a1b2c3d4e5 }
+        - { name: state, in: query, required: true, description: 防 CSRF 回传 state。, schema: { type: string }, example: f0e1d2c3 }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '302':
+          description: 登录成功跳转（Set-Cookie）或失败跳转（Location 含 error 参数）。
+          headers:
+            Location:
+              description: 前端跳转地址。
+              schema: { type: string, format: uri, example: 'https://push.example.com/?oauth=ok' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/channels:
+    get:
+      tags: [channels]
+      operationId: listChannels
+      summary: 自己的通道列表（支持搜索与精简模式）
+      parameters:
+        - { name: keyword, in: query, description: 按名称/备注搜索。, schema: { type: string, maxLength: 64 }, example: tg }
+        - { name: brief, in: query, description: true 时仅返回 id/name/type/enabled。, schema: { type: boolean }, example: false }
+      responses:
+        '200':
+          description: 通道列表（config 中敏感字段显示为 `******`）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelListEnvelope' }
+              example:
+                success: true
+                data:
+                  items:
+                    - id: 1
+                      name: my-tg
+                      type: telegram
+                      enabled: true
+                      description: 个人 TG 机器人
+                      config: { secret: '******', account_id: '123456789' }
+                      created_at: '2026-11-02T10:00:00Z'
+                  page: { page: 1, page_size: 20, total: 1, total_pages: 1 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [channels]
+      operationId: createChannel
+      summary: 新建通道
+      description: 名称 1–20 且本人唯一；保留名 `email` 不可手动创建（由绑定邮箱自动生成）。config 敏感项加密存储。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChannelUpsertRequest' }
+            example:
+              type: telegram
+              name: my-tg
+              description: 个人 TG 机器人
+              enabled: true
+              config: { secret: '7312345678:AAH...', account_id: '123456789' }
+              token: optional-channel-level-push-token
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 创建成功。若请求带了通道级令牌，`access_token` 仅在本响应中明文返回一次。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelCreatedEnvelope' }
+              example:
+                success: true
+                message: 通道创建成功
+                data: { id: 1, name: my-tg, type: telegram, enabled: true, config: { secret: '******', account_id: '123456789' }, created_at: '2026-11-02T10:00:00Z', access_token: null }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/channels/types:
+    get:
+      tags: [channels]
+      operationId: listChannelTypes
+      summary: 通道类型清单（16 类 configSchema + capabilities）
+      description: |
+        返回全部 16 类通道类型的 `configSchema`（驱动前端动态表单：fields 数组含 key/label/type/required/secret 等）
+        与 `capabilities`（title/description/content/url/to/markdown 布尔位 + `toMode` recipient|@mention|chat|none 驱动 to 字段文案与校验）。
+        另有 6 类占位通道 `status: draft`。前端据此渲染表单并按能力标记显隐字段。
+      responses:
+        '200':
+          description: 16 类通道类型描述。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelTypeListEnvelope' }
+              example:
+                success: true
+                data:
+                  total: 16
+                  items:
+                    - type: email
+                      display_name: 邮件
+                      status: core
+                      capabilities: { title: true, description: true, content: true, url: false, to: true, markdown: false, to_mode: recipient }
+                      config_schema:
+                        fields:
+                          - { key: account_id, label: 默认收件人, type: string, required: false, secret: false, help: 留空时发往账号绑定邮箱 }
+                    - type: telegram
+                      display_name: Telegram
+                      status: core
+                      capabilities: { title: false, description: true, content: true, url: false, to: true, markdown: false, to_mode: chat }
+                      config_schema:
+                        fields:
+                          - { key: secret, label: Bot Token, type: password, required: true, secret: true }
+                          - { key: account_id, label: Chat ID, type: string, required: true, secret: false }
+                    - type: ding
+                      display_name: 钉钉群机器人
+                      status: core
+                      capabilities: { title: true, description: true, content: true, url: true, to: true, markdown: true, to_mode: '@mention' }
+                      config_schema:
+                        fields:
+                          - { key: url, label: Webhook 地址, type: string, required: true, secret: false }
+                          - { key: secret, label: 加签密钥, type: password, required: true, secret: true }
+                    - type: one_bot
+                      display_name: QQ(OneBot)
+                      status: draft
+                      capabilities: { title: false, description: true, content: true, url: false, to: true, markdown: false, to_mode: chat }
+                      config_schema:
+                        fields:
+                          - { key: url, label: 服务器地址, type: string, required: true, secret: false }
+                          - { key: secret, label: Access Token, type: password, required: true, secret: true }
+                          - { key: account_id, label: 默认目标(QQ号), type: string, required: false, secret: false }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/channels/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    get:
+      tags: [channels]
+      operationId: getChannel
+      summary: 通道详情（敏感字段隐藏）
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 通道详情。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelEnvelope' }
+              example:
+                success: true
+                data: { id: 1, name: my-tg, type: telegram, enabled: true, description: 个人 TG 机器人, config: { secret: '******', account_id: '123456789' }, created_at: '2026-11-02T10:00:00Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [channels]
+      operationId: updateChannel
+      summary: 编辑通道（或仅切换启停 status_only）
+      description: '`status_only=true` 时仅更新 enabled，不改其它字段；config 中敏感字段传空/缺省表示不修改。'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChannelUpdateRequest' }
+            example:
+              status_only: false
+              enabled: true
+              description: 更新后的备注
+              config: { account_id: '987654321' }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 更新成功（返回隐藏敏感字段后的通道）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelEnvelope' }
+              example: { success: true, message: 通道已更新, data: { id: 1, name: my-tg, type: telegram, enabled: true, config: { secret: '******', account_id: '987654321' }, created_at: '2026-11-02T10:00:00Z' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [channels]
+      operationId: deleteChannel
+      summary: 删除通道（同步清理令牌缓存）
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 删除成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 通道已删除 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/channels/{id}/test:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    post:
+      tags: [channels]
+      operationId: testChannel
+      summary: 通道测试发送
+      description: 发送一条测试消息并回显结果。默认使用通道默认目标；email 通道可临时指定 `to`。
+      requestBody:
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChannelTestRequest' }
+            example: { to: someone@example.com }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 测试结果。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelTestResultEnvelope' }
+              example:
+                success: true
+                data: { success: true, message: 发送成功, latency_ms: 342, raw: 'telegram sendMessage ok' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/channels/{id}/token:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    post:
+      tags: [channels]
+      operationId: rotateChannelToken
+      summary: 重新生成（或设置）通道级推送令牌
+      description: |
+        通道级令牌的轮换入口。返回的 `access_token` 只出现一次；
+        写入后旧令牌立即失效（推送侧只比对当前密文）。省略 body 或 `token` 时生成新的 32 位十六进制令牌。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChannelTokenRequest' }
+            example: { token: optional-custom-channel-token }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 新的通道级令牌（仅本次明文）。 
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ChannelTokenEnvelope' }
+              example: { success: true, message: '', data: { access_token: 6f1c0f9a2b3d4e5f60718293a4b5c6d7 } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/messages:
+    get:
+      tags: [messages]
+      operationId: listMessages
+      summary: 自己的消息列表（分页 + 状态/通道/时间筛选 + 搜索）
+      description: 列表仅返回精简字段（无正文）；按时间倒序。筛选变化重置到第 1 页（前端行为）。
+      parameters:
+        - { $ref: '#/components/parameters/Page' }
+        - { $ref: '#/components/parameters/PageSize' }
+        - { name: keyword, in: query, description: 按标题/内容搜索。, schema: { type: string, maxLength: 64 }, example: 构建 }
+        - { name: status, in: query, description: 状态筛选。, schema: { $ref: '#/components/schemas/MessageStatus' } }
+        - { name: channel, in: query, description: 通道名筛选。, schema: { type: string, maxLength: 20 }, example: telegram }
+        - { name: since, in: query, description: 起始时间（ISO 8601，含）。, schema: { type: string, format: date-time }, example: '2026-11-01T00:00:00Z' }
+        - { name: until, in: query, description: 截止时间（ISO 8601，含）。, schema: { type: string, format: date-time }, example: '2026-11-08T23:59:59Z' }
+      responses:
+        '200':
+          description: 消息分页列表。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessagePageEnvelope' }
+              example:
+                success: true
+                data:
+                  items:
+                    - id: 101
+                      uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c
+                      title: 部署完成
+                      channel_name: my-tg
+                      channel_type: telegram
+                      to: '@all'
+                      status: success
+                      created_at: '2026-11-08T14:03:22Z'
+                  page: { page: 1, page_size: 10, total: 42, total_pages: 5 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    post:
+      tags: [messages]
+      operationId: sendMessage
+      summary: 控制台发送消息
+      description: 登录用户从控制台发送（走与 /push 相同链路，免推送令牌）；支持 async（需持久化权限）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ConsoleSendRequest' }
+            example:
+              channel: my-tg
+              title: 构建失败
+              content: '# 日志\nexit 1'
+              url: 'https://ci.example.com/run/1024'
+              to: '@all'
+              render_mode: markdown
+              async: false
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 发送结果（含 uuid 与状态）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendResultEnvelope' }
+              example:
+                success: true
+                message: 发送成功
+                data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, status: success }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [messages]
+      operationId: clearAllMessages
+      summary: 清空消息（scope=own 本人；scope=all 全部用户·仅 root）
+      description: |
+        硬删除且不可撤销，前端须二次确认。
+        - `scope=own`（默认）：仅删除调用者本人的全部消息，所有已登录用户可用；
+        - `scope=all`：删除**全部用户**的消息（投递明细 MessageDelivery 级联删除），
+          仅超级管理员（root）可用；非 root 调用返回 403 FORBIDDEN。
+        注意：root **账号**不可被删除/禁用（用户管理侧保护），与清空消息是两回事。
+      parameters:
+        - name: scope
+          in: query
+          description: 清空范围：own=仅本人（默认）；all=全部用户（仅 root）。
+          schema: { type: string, enum: [own, all], default: own }
+      responses:
+        '200':
+          description: 清空成功。scope=own 返回「已清空全部消息」；scope=all 返回「已清空全部用户的消息」。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              examples:
+                own: { summary: 清空本人, value: { success: true, message: 已清空全部消息 } }
+                all: { summary: 清空全部用户, value: { success: true, message: 已清空全部用户的消息 } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/messages/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    get:
+      tags: [messages]
+      operationId: getMessage
+      summary: 消息详情（含投递明细）
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 消息详情。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageDetailEnvelope' }
+              example:
+                success: true
+                data:
+                  id: 101
+                  uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c
+                  title: 部署完成
+                  description: 服务已重启
+                  content: '# 详情…'
+                  url: 'https://example.com/log'
+                  channel_name: my-group
+                  channel_type: group
+                  to: '@all'
+                  render_mode: markdown
+                  status: partial
+                  created_at: '2026-11-08T14:03:22Z'
+                  deliveries:
+                    - { id: 9001, channel_id: 1, channel_name: my-tg, status: success, latency_ms: 318, error: null, created_at: '2026-11-08T14:03:22Z' }
+                    - { id: 9002, channel_id: 2, channel_name: my-ding, status: failed, latency_ms: 5010, error: 'dial timeout', created_at: '2026-11-08T14:03:27Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PasswordChangeRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [messages]
+      operationId: updateMessage
+      summary: 编辑自己的消息（仅 pending/failed）
+      description: 仅允许编辑待投递（pending）或投递失败（failed）的消息；已成功投递的消息请使用重发。字段均可选，仅更新提供的字段。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MessageUpdateRequest' }
+            example:
+              title: 部署完成（更新）
+              content: '# 修订后的日志'
+              render_mode: markdown
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 编辑成功，返回更新后的消息详情。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageDetailEnvelope' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PasswordChangeRequired' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [messages]
+      operationId: deleteMessage
+      summary: 删除自己的单条消息
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 删除成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 消息已删除 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/messages/{id}/resend:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    post:
+      tags: [messages]
+      operationId: resendMessage
+      summary: 重发消息（生成新记录与新 uuid）
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 重发结果。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SendResultEnvelope' }
+              example: { success: true, message: 已重发, data: { uuid: 1a2b3c4d5e6f708192a3b4c5d6e7f809, status: success } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/messages/{uuid}:
+    parameters:
+      - $ref: '#/components/parameters/UuidPath'
+    get:
+      tags: [messages]
+      operationId: getPublicMessage
+      summary: 按 uuid 读取消息正文（公开、免鉴权）
+      description: 消息正文分享端点。返回只读公开视图：uuid/title/description/content/url/render_mode/status/created_at；
+        不含 deliveries、ownerId、数值 id、通道与收件人字段。content 为原始内容（未消毒），由前端 DOMPurify 清洗后渲染。
+        注意：与 GET /api/messages/{id} 共用同一路由空间——纯数字路径段按消息 id 处理（需会话鉴权），其余按 uuid 处理。
+      security: []
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 公开消息视图。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PublicMessageDetailEnvelope' }
+              example:
+                success: true
+                data:
+                  uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c
+                  title: 部署完成
+                  description: 服务已重启
+                  content: '# 详情…'
+                  url: 'https://example.com/log'
+                  render_mode: markdown
+                  status: success
+                  created_at: '2026-11-08T14:03:22Z'
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/messages/{uuid}/status:
+    parameters:
+      - $ref: '#/components/parameters/UuidPath'
+    get:
+      tags: [messages]
+      operationId: getMessageStatus
+      summary: 按 uuid 查询消息状态（公开、免鉴权）
+      security: []
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 当前状态。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MessageStatusEnvelope' }
+              example:
+                success: true
+                message: ''
+                data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, status: success }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/webhooks:
+    get:
+      tags: [webhooks]
+      operationId: listWebhooks
+      summary: 自己的 Webhook 列表（含触发 URL）
+      parameters:
+        - { name: keyword, in: query, description: 按名称搜索。, schema: { type: string, maxLength: 64 }, example: github }
+      responses:
+        '200':
+          description: Webhook 列表。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookListEnvelope' }
+              example:
+                success: true
+                data:
+                  items:
+                    - id: 3
+                      name: gh-star
+                      link: 7c9f1d2e3b4a5f60718293a4b5c6d7e8
+                      target_channel: my-ding
+                      enabled: true
+                      trigger_url: 'https://push.example.com/webhook/7c9f1d2e3b4a5f60718293a4b5c6d7e8'
+                      extract_rule: { repo: repository.full_name, sender: sender.login, stars: repository.stargazers_count }
+                      construct_rule: { title: '⭐ 新 Star：$repo', description: '$sender 给 $repo 点了 star（共 $stars）', content: '', url: '' }
+                      created_at: '2026-11-03T08:00:00Z'
+                  page: { page: 1, page_size: 20, total: 1, total_pages: 1 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    post:
+      tags: [webhooks]
+      operationId: createWebhook
+      summary: 新建 Webhook（服务端生成 32 位不可预测短链 link）
+      description: 提取规则为「键→请求体 JSON 路径」映射；构造规则为「消息字段→含 `$键` 的模板」。保存时做合法性校验。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookUpsertRequest' }
+            example:
+              name: gh-star
+              target_channel: my-ding
+              enabled: true
+              extract_rule: { repo: repository.full_name, sender: sender.login, stars: repository.stargazers_count }
+              construct_rule: { title: '⭐ 新 Star：$repo', description: '$sender 给 $repo 点了 star（共 $stars）' }
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 创建成功（含生成的 link 与触发 URL）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEnvelope' }
+              example:
+                success: true
+                message: Webhook 创建成功
+                data:
+                  id: 3
+                  name: gh-star
+                  link: 7c9f1d2e3b4a5f60718293a4b5c6d7e8
+                  target_channel: my-ding
+                  enabled: true
+                  trigger_url: 'https://push.example.com/webhook/7c9f1d2e3b4a5f60718293a4b5c6d7e8'
+                  extract_rule: { repo: repository.full_name, sender: sender.login, stars: repository.stargazers_count }
+                  construct_rule: { title: '⭐ 新 Star：$repo', description: '$sender 给 $repo 点了 star（共 $stars）', content: '', url: '' }
+                  created_at: '2026-11-03T08:00:00Z'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/webhooks/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    get:
+      tags: [webhooks]
+      operationId: getWebhook
+      summary: Webhook 详情
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: Webhook 详情。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEnvelope' }
+              example:
+                success: true
+                data: { id: 3, name: gh-star, link: 7c9f1d2e3b4a5f60718293a4b5c6d7e8, target_channel: my-ding, enabled: true, trigger_url: 'https://push.example.com/webhook/7c9f1d2e3b4a5f60718293a4b5c6d7e8', extract_rule: { repo: repository.full_name }, construct_rule: { title: '⭐ $repo' }, created_at: '2026-11-03T08:00:00Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [webhooks]
+      operationId: updateWebhook
+      summary: 编辑 Webhook（或仅启停）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookUpdateRequest' }
+            example: { status_only: true, enabled: false }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 更新成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookEnvelope' }
+              example: { success: true, message: Webhook 已更新, data: { id: 3, name: gh-star, link: 7c9f1d2e3b4a5f60718293a4b5c6d7e8, target_channel: my-ding, enabled: false, trigger_url: 'https://push.example.com/webhook/7c9f1d2e3b4a5f60718293a4b5c6d7e8', extract_rule: { repo: repository.full_name }, construct_rule: { title: '⭐ $repo' }, created_at: '2026-11-03T08:00:00Z' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [webhooks]
+      operationId: deleteWebhook
+      summary: 删除 Webhook
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 删除成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: Webhook 已删除 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /webhook/{name}:
+    post:
+      tags: [webhooks]
+      operationId: triggerWebhook
+      summary: 外部系统触发 Webhook（免令牌）
+      description: |
+        `name` 为 Webhook 的 32 位不可预测短链 link。服务端按提取规则从请求体 JSON 路径取值，
+        替换构造规则模板中的 `$键`，组装 PushMessage 后免推送令牌走推送链路。
+        请求体可为任意 JSON。Webhook 不存在→404；未启用→403。
+      security: []
+      parameters:
+        - { name: name, in: path, required: true, description: Webhook link（32 位短链）。, schema: { type: string, minLength: 32, maxLength: 32 }, example: 7c9f1d2e3b4a5f60718293a4b5c6d7e8 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookTriggerPayload' }
+            example:
+              action: starred
+              repository: { full_name: hope/nectarpush, stargazers_count: 128 }
+              sender: { login: someone }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 触发结果（返回推送 uuid）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushResultEnvelope' }
+              example: { success: true, message: '', data: { uuid: 2b3c4d5e6f708192a3b4c5d6e7f80911 } }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/users:
+    get:
+      tags: [users]
+      operationId: listUsers
+      summary: 用户分页列表（admin）
+      parameters:
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/PageSize'
+        - { name: keyword, in: query, description: 按用户名/显示名搜索。, schema: { type: string, maxLength: 64 }, example: hop }
+        - { name: include_deleted, in: query, description: 包含已注销（软删）用户，默认 false。, schema: { type: boolean, default: false } }
+      responses:
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '200':
+          description: 用户分页列表。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserPageEnvelope' }
+              example:
+                success: true
+                data:
+                  items:
+                    - id: 2
+                      username: hope
+                      display_name: Hope
+                      role: user
+                      status: active
+                      email: hope@example.com
+                      default_channel: email
+                      permissions: { send_email_to_others: false, save_message: true }
+                      must_change_password: false
+                      deleted_at: null
+                      created_at: '2026-11-01T09:30:00Z'
+                  page: { page: 1, page_size: 10, total: 3, total_pages: 1 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    post:
+      tags: [users]
+      operationId: createUser
+      summary: 新建用户（不可创建 ≥ 自身权限者）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserCreateRequest' }
+            example: { username: alice, password: 'alice!pass99', display_name: Alice, role: user }
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 创建成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+              example:
+                success: true
+                message: 用户创建成功
+                data: { id: 4, username: alice, display_name: Alice, role: user, status: active, email: null, default_channel: null, permissions: { send_email_to_others: false, save_message: true }, created_at: '2026-11-08T15:00:00Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/users/{id}:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    get:
+      tags: [users]
+      operationId: getUser
+      summary: 用户详情（仅可看更低权限者）
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 用户详情。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+              example:
+                success: true
+                data: { id: 4, username: alice, display_name: Alice, role: user, status: active, email: alice@example.com, default_channel: null, permissions: { send_email_to_others: false, save_message: true }, created_at: '2026-11-08T15:00:00Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    patch:
+      tags: [users]
+      operationId: updateUser
+      summary: 编辑用户（允许修改：用户名/显示名/密码）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserUpdateRequest' }
+            example: { display_name: Alice2, password: 'new!pass123' }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 更新成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+              example: { success: true, message: 用户已更新, data: { id: 4, username: alice, display_name: Alice2, role: user, status: active, email: alice@example.com, default_channel: null, permissions: { send_email_to_others: false, save_message: true }, created_at: '2026-11-08T15:00:00Z' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [users]
+      operationId: deleteUser
+      summary: 删除用户（仅更低权限；软删 + 匿名化）
+      description: 删除采用软删匿名化：消息/通道保留归属但不包含个人信息。
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '200':
+          description: 删除成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 用户已删除 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/users/{id}/restore:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    post:
+      tags: [users]
+      operationId: restoreUser
+      summary: 恢复已注销（软删）用户
+      description: |
+        撤销软删除：清除 deletedAt 并恢复 active。恢复后该用户没有可用凭据（删除时密码/OAuth 已清空），
+        管理员需通过 PATCH /api/users/{id} 重置密码（重置后强制改密）后其才能登录。
+        用户名规则：未指定 username 时沿用当前存储名（deleted_{id}）；若该名已被他人注册则自动生成
+        restored_{id}_{n} 形式的新用户名；显式指定 username 且被占用返回 422 DUPLICATE_NAME。
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserRestoreRequest' }
+            example: { username: hope }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 恢复成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+              example:
+                success: true
+                message: 用户已恢复
+                data: { id: 2, username: hope, display_name: Hope, role: user, status: active, email: null, default_channel: null, permissions: { send_email_to_others: false, save_message: true }, must_change_password: true, deleted_at: null, created_at: '2026-11-01T09:30:00Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/users/{id}/manage:
+    parameters:
+      - $ref: '#/components/parameters/IdPath'
+    post:
+      tags: [users]
+      operationId: manageUser
+      summary: 用户动作（启禁/升降级/授权）
+      description: |
+        动作：`enable` / `disable` / `promote` / `demote` / `allow_send_email_to_others` /
+        `disallow_send_email_to_others` / `allow_save_message` / `disallow_save_message`。
+        权限约束：不可操作同级或更高权限的用户；仅 root 可提升他人为 admin；不可禁用/删除 root。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UserManageRequest' }
+            example: { action: allow_save_message }
+      responses:
+        '414': { $ref: '#/components/responses/UriTooLong' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 动作生效，返回最新用户快照。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+              example:
+                success: true
+                message: 操作成功
+                data: { id: 4, username: alice, display_name: Alice, role: user, status: active, email: alice@example.com, default_channel: null, permissions: { send_email_to_others: false, save_message: true }, created_at: '2026-11-08T15:00:00Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/options:
+    get:
+      tags: [options]
+      operationId: getOptions
+      summary: 读取系统设置（root；敏感项不回显）
+      description: 返回全部 Option（分组：通用/注册与登录/邮件 SMTP/OAuth2/Turnstile/消息持久化与渲染/展示文案）。键名含 Token/Secret/Password 的敏感项不回显明文（仅返回已配置标记）。
+      responses:
+        '200':
+          description: 设置项列表。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OptionListEnvelope' }
+              example:
+                success: true
+                data:
+                  items:
+                    - { key: SystemName, value: NectarPush, sensitive: false }
+                    - { key: ServerAddress, value: 'https://push.example.com', sensitive: false }
+                    - { key: RegisterEnabled, value: 'true', sensitive: false }
+                    - { key: SMTPServer, value: smtp.example.com, sensitive: false }
+                    - { key: SMTPToken, value: '', sensitive: true, configured: true }
+                    - { key: OAuth2Providers, value: '[{"id":"github","authorize_url":"https://github.com/login/oauth/authorize","token_url":"https://github.com/login/oauth/access_token","userinfo_url":"https://api.github.com/user","client_id":"Iv1.xxxx","scope":"read:user","map_username":"login","map_email":"email"}]', sensitive: true, configured: true }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+    patch:
+      tags: [options]
+      operationId: updateOption
+      summary: 更新设置项（root；启用前校验依赖已填）
+      description: 单项更新；启用 OAuth2 登录前须已填 ClientId/Secret；启用 Turnstile 前须填 SiteKey/Secret；启用邮箱验证前须 SMTP 可用（依赖缺失返回 422 DEPENDENCY_MISSING）。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OptionUpdateRequest' }
+            example: { key: Notice, value: '欢迎使用蜂鸟推送' }
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 更新成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 设置已保存 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/options/oauth2/discover:
+    post:
+      tags: [options]
+      operationId: discoverOAuth2
+      summary: 从 OIDC 发现端点补全 OAuth2 端点（root）
+      description: |
+        输入 issuer 或完整 `.well-known/openid-configuration` 地址；服务端补全 well-known 后缀并读取
+        `authorization_endpoint` / `token_endpoint` / `userinfo_endpoint` / `scopes_supported`。
+        返回的是建议值，管理员仍可手改；不会写入任何配置。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OAuthDiscoveryRequest' }
+            example: { url: 'https://sso.example.com/application/o/nectarpush' }
+      responses:
+        '200':
+          description: 发现成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/OAuthDiscoveryEnvelope' }
+              example:
+                success: true
+                data:
+                  issuer: 'https://sso.example.com/application/o/nectarpush/'
+                  authorize_url: 'https://sso.example.com/application/o/authorize/'
+                  token_url: 'https://sso.example.com/application/o/token/'
+                  userinfo_url: 'https://sso.example.com/application/o/userinfo/'
+                  scope: 'openid profile email'
+                  map_username: sub
+                  map_email: email
+                  scopes_supported: [openid, email, profile]
+                  warnings: []
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+        '502':
+          description: 上游发现文档不可访问或结构非法（OAUTH_DISCOVERY_FAILED）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+
+  /api/me:
+    get:
+      tags: [me]
+      operationId: getMe
+      summary: 当前用户信息
+      responses:
+        '200':
+          description: 当前用户。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+              example:
+                success: true
+                data: { id: 2, username: hope, display_name: Hope, role: user, status: active, email: hope@example.com, default_channel: email, permissions: { send_email_to_others: false, save_message: true }, must_change_password: false, deleted_at: null, created_at: '2026-11-01T09:30:00Z' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PasswordChangeRequired' }
+    patch:
+      tags: [me]
+      operationId: updateMe
+      summary: 更新个人资料（允许修改的字段）
+      description: 允许修改：username / display_name / password（旧密码验证）/ default_channel；role、status 等不可经此修改。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/MeUpdateRequest' }
+            example: { display_name: Hope2, default_channel: my-tg, old_password: 'h0pe!pass42', password: 'n3w!pass42' }
+      responses:
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 更新成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/UserEnvelope' }
+              example: { success: true, message: 已保存, data: { id: 2, username: hope, display_name: Hope2, role: user, status: active, email: hope@example.com, default_channel: my-tg, permissions: { send_email_to_others: false, save_message: true }, created_at: '2026-11-01T09:30:00Z' } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+    delete:
+      tags: [me]
+      operationId: deleteMe
+      summary: 注销账号（软删 + 匿名化 + 清理令牌缓存）
+      responses:
+        '200':
+          description: 注销成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 账号已注销 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/me/token:
+    post:
+      tags: [me]
+      operationId: regenerateToken
+      summary: 生成/重置全局推送令牌（旧令牌立即失效）
+      responses:
+        '200':
+          description: 新令牌（去掉连字符的 UUID，全局唯一；仅本次完整返回）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TokenResultEnvelope' }
+              example:
+                success: true
+                message: 令牌已生成
+                data: { token: e5f60718293a4b5c6d7e8f9a0b1c2d34 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/me/push:
+    get:
+      tags: [me]
+      operationId: getPushSettings
+      summary: 推送设置（含可用示例）
+      responses:
+        '200':
+          description: 推送设置与示例。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushSettingsEnvelope' }
+              example:
+                success: true
+                data:
+                  username: hope
+                  default_channel: my-tg
+                  token_masked: 'e5f6•••••••••••••••d34'
+                  push_endpoint: 'https://push.example.com/push/hope'
+                  examples:
+                    curl: "curl -X POST 'https://push.example.com/push/hope' -H 'Content-Type: application/json' -d '{\"title\":\"Hi\",\"description\":\"来自 curl\",\"token\":\"<你的令牌>\"}'"
+        '401': { $ref: '#/components/responses/Unauthorized' }
+    patch:
+      tags: [me]
+      operationId: updatePushSettings
+      summary: 更新推送设置（默认通道）
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PushSettingsUpdateRequest' }
+            example: { default_channel: my-ding }
+      responses:
+        '404': { $ref: '#/components/responses/NotFound' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '200':
+          description: 更新成功。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PushSettingsEnvelope' }
+              example: { success: true, message: 已保存, data: { username: hope, default_channel: my-ding, token_masked: 'e5f6•••••••••••••••d34', push_endpoint: 'https://push.example.com/push/hope', examples: { curl: '…' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/me/security:
+    get:
+      tags: [me]
+      operationId: getMeSecurity
+      summary: 账号安全状态（密码/邮箱验证/第三方绑定）
+      responses:
+        '200':
+          description: 安全状态。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MeSecurityEnvelope' }
+              example:
+                success: true
+                data:
+                  has_password: true
+                  email_verification_enabled: false
+                  email_change_requires_code: true
+                  oauth:
+                    bindings: [{ provider: github, display_name: GitHub, oauth_id: '1234567' }]
+                    providers: [{ id: github, display_name: GitHub }]
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/PasswordChangeRequired' }
+
+  /api/me/email/verification:
+    post:
+      tags: [me]
+      operationId: sendEmailChangeCode
+      summary: 发送修改邮箱的验证码
+      description: 已配置 SMTP 时向新邮箱发送 6 位验证码，修改邮箱必须携带；未配置 SMTP 时返回 sent=false，邮箱仍可直接保存，但暂时无法用于找回密码。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EmailChangeRequest' }
+            example: { email: new@example.com }
+      responses:
+        '200':
+          description: 发送结果。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EmailChangeEnvelope' }
+              example: { success: true, data: { sent: true, required: true, message: 验证码已发送 } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/me/oauth/{provider}/start:
+    get:
+      tags: [me]
+      operationId: startOAuthBind
+      summary: 发起第三方账号绑定（302）
+      description: 生成的 state 记录 bind 意图与当前用户 id；回调成功后跳转 `/me?oauth_bound=<provider>`。
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, maxLength: 32 }, example: github }
+      responses:
+        '302':
+          description: 重定向到 Provider 授权页。
+          headers:
+            Location: { schema: { type: string, format: uri } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/me/oauth/{provider}:
+    delete:
+      tags: [me]
+      operationId: unbindOAuth
+      summary: 解绑指定第三方账号（多绑）
+      description: 按 provider 解绑单条绑定；账号尚无登录密码时拒绝解绑（422），避免把自己锁在门外；未绑定该 provider 返回 422。
+      parameters:
+        - { name: provider, in: path, required: true, schema: { type: string, maxLength: 32 }, example: github }
+      responses:
+        '200':
+          description: 已解绑。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SuccessEnvelope' }
+              example: { success: true, message: 已解绑第三方账号 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '422': { $ref: '#/components/responses/ValidationError' }
+
+  /api/events:
+    get:
+      tags: [realtime]
+      operationId: subscribeEvents
+      summary: SSE 事件流（登录用户）
+      description: |
+        `text/event-stream` 长连接。事件按登录用户隔离：`message.created` / `delivery.updated`
+        仅推送本人消息的事件，不会跨用户泄露。事件类型（event 名）：
+        - `message.created`：新消息写入数据库（负载 = MessageSummary）；
+        - `delivery.updated`：投递明细状态变化（负载 = MessageDelivery）；
+        - `heartbeat`：每 25 秒注释行保活。
+        负载为 JSON（data 字段），结构同对应 schema。
+      responses:
+        '200':
+          description: SSE 事件流。
+          content:
+            text/event-stream:
+              schema: { type: string }
+              example: |
+                event: message.created
+                data: {"id":102,"uuid":"1a2b3c4d5e6f708192a3b4c5d6e7f809","title":"部署完成","channel_name":"my-tg","channel_type":"telegram","to":"@all","status":"async_pending","created_at":"2026-11-08T14:10:00Z"}
+
+                event: delivery.updated
+                data: {"id":9003,"message_id":102,"channel_id":1,"channel_name":"my-tg","status":"success","latency_ms":289,"error":null,"created_at":"2026-11-08T14:10:01Z"}
+
+                : heartbeat
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/public/about:
+    get:
+      tags: [public]
+      operationId: getAbout
+      summary: 关于（公开）
+      security: []
+      responses:
+        '200':
+          description: 关于文本。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TextContentEnvelope' }
+              example: { success: true, data: { content: '## 蜂鸟推送\n自托管的多渠道消息推送服务。' } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/public/announcement:
+    get:
+      tags: [public]
+      operationId: getAnnouncement
+      summary: 公告（公开）
+      security: []
+      responses:
+        '200':
+          description: 公告文本（空内容返回空串）。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TextContentEnvelope' }
+              example: { success: true, data: { content: '系统将于周日晚维护。' } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/public/footer:
+    get:
+      tags: [public]
+      operationId: getFooter
+      summary: 页脚内容（公开）
+      description: 站点页脚文本（管理员在系统设置 Footer 中配置），空内容返回空串。
+      security: []
+      responses:
+        '200':
+          description: 页脚文本。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TextContentEnvelope' }
+              example: { success: true, data: { content: '© 2026 NectarPush · 自托管消息推送' } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/public/turnstile-sitekey:
+    get:
+      tags: [public]
+      operationId: getTurnstileSiteKey
+      summary: Turnstile 人机验证站点密钥（公开）
+      description: |
+        登录/注册页引导 Turnstile 前端组件。仅返回开关与 SiteKey；
+        TurnstileSecretKey 绝不出现在任何公开响应中。
+      security: []
+      responses:
+        '200':
+          description: Turnstile 站点配置。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TurnstileSiteKeyEnvelope' }
+              example: { success: true, data: { enabled: true, site_key: 0x4AAAAAAA1234567890 } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/health:
+    get:
+      tags: [public]
+      operationId: health
+      summary: 健康检查（公开）
+      security: []
+      responses:
+        '200':
+          description: 存活探针。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/HealthEnvelope' }
+              example: { success: true, data: { status: ok, uptime_seconds: 86400, database: ok } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+  /api/version:
+    get:
+      tags: [public]
+      operationId: version
+      summary: 版本（公开）
+      security: []
+      responses:
+        '200':
+          description: 版本信息。
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/VersionEnvelope' }
+              example: { success: true, data: { version: 1.0.0, commit: a1b2c3d } }
+        '429': { $ref: '#/components/responses/RateLimited' }
+
+components:
+  securitySchemes:
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: np_session
+      description: Web 控制台会话（登录后由服务端 Set-Cookie，HttpOnly）。
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: 用户全局推送令牌（`POST /api/me/token` 生成）；亦用于 `/push` 的 Authorization 头。
+    pushTokenQuery:
+      type: apiKey
+      in: query
+      name: token
+      description: 推送令牌放 query 的形式（`/push/{username}?token=…`）。
+
+  parameters:
+    UsernamePath:
+      name: username
+      in: path
+      required: true
+      description: 目标用户名（唯一）。
+      schema: { type: string, maxLength: 12 }
+      example: hope
+    IdPath:
+      name: id
+      in: path
+      required: true
+      description: 数值主键。
+      schema: { type: integer, minimum: 1 }
+      example: 1
+    UuidPath:
+      name: uuid
+      in: path
+      required: true
+      description: 消息唯一 uuid（异步状态查询键）。
+      schema: { type: string, minLength: 32, maxLength: 32 }
+      example: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c
+    Page:
+      name: page
+      in: query
+      description: 页码（1 起）。
+      schema: { type: integer, minimum: 1, default: 1 }
+      example: 1
+    PageSize:
+      name: page_size
+      in: query
+      description: 每页条数。
+      schema: { type: integer, minimum: 1, maximum: 100, default: 10 }
+      example: 10
+
+  responses:
+    BadRequest:
+      description: 请求体不可解析（如空 body 或非法 JSON）。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example: { success: false, message: 请求体格式错误, code: VALIDATION_FAILED }
+    Unauthorized:
+      description: 未登录 / 缺少或错误的推送令牌。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            tokenRequired:
+              summary: 需要令牌
+              value: { success: false, message: 通道维度或用户维度设置了鉴权令牌，需要提供鉴权令牌, code: TOKEN_REQUIRED }
+            invalidToken:
+              summary: 令牌错误
+              value: { success: false, message: 无效的 token, code: INVALID_TOKEN }
+            notLoggedIn:
+              summary: 未登录
+              value: { success: false, message: 未登录或会话已过期, code: UNAUTHORIZED }
+    Forbidden:
+      description: 已认证但无权（角色不足 / 资源禁用 / 开关关闭）。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example: { success: false, message: 无权执行该操作, code: FORBIDDEN }
+    PasswordChangeRequired:
+      description: 会话处于强制改密状态（mustChangePassword=true），仅 PATCH /api/me 与 POST /api/auth/logout 放行。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example: { success: false, message: 请先修改密码, code: PASSWORD_CHANGE_REQUIRED }
+    NotFound:
+      description: 资源不存在（用户/通道/消息/Webhook 等）。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          examples:
+            user:
+              value: { success: false, message: 用户不存在, code: USER_NOT_FOUND }
+            message:
+              value: { success: false, message: 消息不存在, code: NOT_FOUND }
+    ValidationError:
+      description: 参数校验失败或依赖缺失。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example: { success: false, message: 异步发送消息需要用户具备消息持久化的权限, code: ASYNC_NOT_ALLOWED }
+    RateLimited:
+      description: 触发限流。
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/ErrorEnvelope' }
+          example: { success: false, message: 操作过于频繁，请稍后再试, code: RATE_LIMITED }
+    UriTooLong:
+      description: 路径参数长度超过 Fastify 路由 maxParamLength（默认 100）上限，由框架直接拒绝；属框架级保护，不是业务状态。
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: true
+          example:
+            error: Bad Request
+            code: FST_ERR_MAX_PARAM_LENGTH
+            message: 请求路径参数过长
+
+  schemas:
+    ErrorCode:
+      type: string
+      description: 统一错误码枚举。
+      enum:
+        - UNAUTHORIZED
+        - TOKEN_REQUIRED
+        - INVALID_TOKEN
+        - FORBIDDEN
+        - NOT_FOUND
+        - USER_NOT_FOUND
+        - USER_DISABLED
+        - PASSWORD_CHANGE_REQUIRED
+        - CHANNEL_NOT_FOUND
+        - CHANNEL_DISABLED
+        - CHANNEL_NAME_RESERVED
+        - DUPLICATE_NAME
+        - WEBHOOK_NOT_FOUND
+        - WEBHOOK_DISABLED
+        - VALIDATION_FAILED
+        - ASYNC_NOT_ALLOWED
+        - SMTP_NOT_CONFIGURED
+        - CLIENT_NOT_CONNECTED
+        - OAUTH_PROVIDER_NOT_CONFIGURED
+        - OAUTH_ALREADY_BOUND
+        - OAUTH_DISCOVERY_FAILED
+        - DEPENDENCY_MISSING
+        - RATE_LIMITED
+        - INTERNAL_ERROR
+
+    ErrorEnvelope:
+      type: object
+      description: 统一的失败响应格式。
+      properties:
+        success: { type: boolean, const: false }
+        message: { type: string, description: 人类可读错误信息（简体中文）。 }
+        code: { $ref: '#/components/schemas/ErrorCode' }
+      required: [success, message]
+      example: { success: false, message: 无效的 token, code: INVALID_TOKEN }
+
+    SuccessEnvelope:
+      type: object
+      description: 统一的成功响应格式（无数据负载）。
+      properties:
+        success: { type: boolean, const: true }
+        message: { type: string, example: 操作成功 }
+      required: [success]
+
+    PageMeta:
+      type: object
+      description: 分页元信息（Page&lt;T&gt; 的公共部分）。
+      properties:
+        page: { type: integer, minimum: 1 }
+        page_size: { type: integer, minimum: 1, maximum: 100 }
+        total: { type: integer, minimum: 0 }
+        total_pages: { type: integer, minimum: 0 }
+      required: [page, page_size, total, total_pages]
+      example: { page: 1, page_size: 10, total: 42, total_pages: 5 }
+
+    RenderMode:
+      type: string
+      description: 渲染模式（缺省 markdown）。
+      enum: [markdown, code, raw]
+      example: markdown
+
+    MessageStatus:
+      type: string
+      description: 消息状态（产品层枚举；群组按投递明细聚合）。
+      enum: [pending, async_pending, success, partial, failed]
+      example: success
+
+    UserRole:
+      type: string
+      description: 角色（当前版本只有 user/admin/root 三级）。
+      enum: [user, admin, root]
+      example: user
+
+    UserStatus:
+      type: string
+      enum: [active, disabled]
+      example: active
+
+    ChannelType:
+      type: string
+      description: 通道类型（16 类；QQ 通道为 one_bot，不用 one_api）。
+      enum: [email, telegram, discord, ding, lark, bark, custom, client, group, none, test, corp_app, corp, lark_app, one_bot, tencent_alarm]
+      example: telegram
+
+    # ---------- 实体 ----------
+
+    UserPermissions:
+      type: object
+      description: 用户授权位（管理员经 /api/users/{id}/manage 授予）。
+      properties:
+        send_email_to_others: { type: boolean, description: 允许邮件发往他人邮箱。 }
+        save_message: { type: boolean, description: 允许消息持久化（async 前置条件）。 }
+      required: [send_email_to_others, save_message]
+      example: { send_email_to_others: false, save_message: true }
+
+    User:
+      type: object
+      description: 用户实体（不含密码哈希与令牌明文）。
+      properties:
+        id: { type: integer }
+        username: { type: string, maxLength: 12 }
+        display_name: { type: string, maxLength: 20 }
+        role: { $ref: '#/components/schemas/UserRole' }
+        status: { $ref: '#/components/schemas/UserStatus' }
+        email: { type: [string, 'null'], format: email, maxLength: 50, description: 绑定邮箱；注销匿名化后为 null。 }
+        default_channel: { type: [string, 'null'], maxLength: 20, description: 默认推送通道名。 }
+        permissions: { $ref: '#/components/schemas/UserPermissions' }
+        must_change_password: { type: boolean, description: 强制改密标志；为 true 时受保护接口返回 403 PASSWORD_CHANGE_REQUIRED。 }
+        deleted_at: { type: [string, 'null'], format: date-time, description: 软删时间；未注销为 null。 }
+        created_at: { type: string, format: date-time }
+      required: [id, username, display_name, role, status, permissions, must_change_password, deleted_at, created_at]
+      example:
+        id: 2
+        username: hope
+        display_name: Hope
+        role: user
+        status: active
+        email: hope@example.com
+        default_channel: email
+        permissions: { send_email_to_others: false, save_message: true }
+        must_change_password: false
+        deleted_at: null
+        created_at: '2026-11-01T09:30:00Z'
+
+    ChannelConfigPublic:
+      type: object
+      description: 通道配置（响应视图；敏感字段值一律替换为 `******`，未设置的字段不出现）。
+      additionalProperties: { type: string, description: 配置键值（键见 config_schema.fields，如 secret/account_id/url/other）。 }
+      example: { secret: '******', account_id: '123456789' }
+
+    ChannelConfigInput:
+      type: object
+      description: 通道配置（请求视图；敏感字段留空/缺省表示「不修改」）。
+      additionalProperties: { type: string }
+
+    Channel:
+      type: object
+      description: 通道实体（响应视图，config 隐藏敏感字段）。
+      properties:
+        id: { type: integer }
+        name: { type: string, minLength: 1, maxLength: 20 }
+        type: { $ref: '#/components/schemas/ChannelType' }
+        description: { type: [string, 'null'], description: 备注。 }
+        enabled: { type: boolean }
+        config: { $ref: '#/components/schemas/ChannelConfigPublic' }
+        created_at: { type: string, format: date-time }
+      required: [id, name, type, enabled, config, created_at]
+      example: { id: 1, name: my-tg, type: telegram, description: 个人 TG 机器人, enabled: true, config: { secret: '******', account_id: '123456789' }, created_at: '2026-11-02T10:00:00Z' }
+
+    MessageSummary:
+      type: object
+      description: 消息精简视图（列表用，无正文）。
+      properties:
+        id: { type: integer }
+        uuid: { type: string, minLength: 32, maxLength: 32, description: 唯一 uuid（分享与状态查询键）。 }
+        title: { type: [string, 'null'], maxLength: 512 }
+        channel_name: { type: string }
+        channel_type: { $ref: '#/components/schemas/ChannelType' }
+        to: { type: [string, 'null'], maxLength: 256 }
+        status: { $ref: '#/components/schemas/MessageStatus' }
+        created_at: { type: string, format: date-time }
+      required: [id, uuid, channel_name, channel_type, status, created_at]
+      example: { id: 101, uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, title: 部署完成, channel_name: my-tg, channel_type: telegram, to: '@all', status: success, created_at: '2026-11-08T14:03:22Z' }
+
+    MessageDelivery:
+      type: object
+      description: 消息投递明细（群组/多目标时一条消息多条）。
+      properties:
+        id: { type: integer }
+        channel_id: { type: integer }
+        channel_name: { type: string }
+        status: { type: string, enum: [pending, success, failed], description: 单目标投递状态。 }
+        latency_ms: { type: [integer, 'null'], description: 上游耗时毫秒。 }
+        error: { type: [string, 'null'], description: 失败原因（上游可读错误）。 }
+        created_at: { type: string, format: date-time }
+      required: [id, channel_id, channel_name, status, created_at]
+      example: { id: 9001, channel_id: 1, channel_name: my-tg, status: success, latency_ms: 318, error: null, created_at: '2026-11-08T14:03:22Z' }
+
+    MessageDetail:
+      type: object
+      description: 消息详情（含正文与投递明细）。
+      properties:
+        id: { type: integer }
+        uuid: { type: string, minLength: 32, maxLength: 32 }
+        title: { type: [string, 'null'], maxLength: 512 }
+        description: { type: [string, 'null'] }
+        content: { type: [string, 'null'], description: Markdown 源。 }
+        url: { type: [string, 'null'], format: uri }
+        channel_name: { type: string }
+        channel_type: { $ref: '#/components/schemas/ChannelType' }
+        to: { type: [string, 'null'], maxLength: 256 }
+        render_mode: { $ref: '#/components/schemas/RenderMode' }
+        status: { $ref: '#/components/schemas/MessageStatus' }
+        created_at: { type: string, format: date-time }
+        deliveries:
+          type: array
+          description: 投递明细（群组分发/广播时多条；单通道一条）。
+          items: { $ref: '#/components/schemas/MessageDelivery' }
+      required: [id, uuid, channel_name, channel_type, render_mode, status, created_at, deliveries]
+      example:
+        id: 101
+        uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c
+        title: 部署完成
+        description: 服务已重启
+        content: '# 详情…'
+        url: 'https://example.com/log'
+        channel_name: my-tg
+        channel_type: telegram
+        to: '@all'
+        render_mode: markdown
+        status: success
+        created_at: '2026-11-08T14:03:22Z'
+        deliveries:
+          - { id: 9001, channel_id: 1, channel_name: my-tg, status: success, latency_ms: 318, error: null, created_at: '2026-11-08T14:03:22Z' }
+
+    PublicMessageDetail:
+      type: object
+      description: 消息正文公开视图（按 uuid 分享）。不含 deliveries、ownerId、数值 id、通道与收件人字段；
+        content 为原始内容（未消毒），由前端 DOMPurify 清洗后渲染。
+      properties:
+        uuid: { type: string, minLength: 32, maxLength: 32 }
+        title: { type: [string, 'null'], maxLength: 512 }
+        description: { type: [string, 'null'] }
+        content: { type: [string, 'null'], description: 原始正文（前端负责消毒）。 }
+        url: { type: [string, 'null'], format: uri }
+        render_mode: { $ref: '#/components/schemas/RenderMode' }
+        status: { $ref: '#/components/schemas/MessageStatus' }
+        created_at: { type: string, format: date-time }
+      required: [uuid, render_mode, status, created_at]
+      example:
+        uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c
+        title: 部署完成
+        description: 服务已重启
+        content: '# 详情…'
+        url: 'https://example.com/log'
+        render_mode: markdown
+        status: success
+        created_at: '2026-11-08T14:03:22Z'
+
+    Webhook:
+      type: object
+      description: Webhook 实体（由外部事件触发推送的入口）。
+      properties:
+        id: { type: integer }
+        name: { type: string, minLength: 1, maxLength: 20 }
+        link: { type: string, minLength: 32, maxLength: 32, description: '服务端生成的不可预测短链（触发路径 /webhook/{link}）。' }
+        target_channel: { type: string, maxLength: 20, description: 目标通道名。 }
+        enabled: { type: boolean }
+        trigger_url: { type: string, format: uri, description: 完整触发 URL（ServerAddress 拼接）。 }
+        extract_rule: { $ref: '#/components/schemas/WebhookExtractRule' }
+        construct_rule: { $ref: '#/components/schemas/WebhookConstructRule' }
+        created_at: { type: string, format: date-time }
+      required: [id, name, link, target_channel, enabled, trigger_url, extract_rule, construct_rule, created_at]
+      example:
+        id: 3
+        name: gh-star
+        link: 7c9f1d2e3b4a5f60718293a4b5c6d7e8
+        target_channel: my-ding
+        enabled: true
+        trigger_url: 'https://push.example.com/webhook/7c9f1d2e3b4a5f60718293a4b5c6d7e8'
+        extract_rule: { repo: repository.full_name, sender: sender.login, stars: repository.stargazers_count }
+        construct_rule: { title: '⭐ 新 Star：$repo', description: '$sender 给 $repo 点了 star（共 $stars）', content: '', url: '' }
+        created_at: '2026-11-03T08:00:00Z'
+
+    WebhookExtractRule:
+      type: object
+      description: 提取规则：自定义键 → 请求体 JSON 路径（点号分隔）。
+      additionalProperties: { type: string, description: JSON 路径，如 repository.full_name。 }
+      example: { repo: repository.full_name, sender: sender.login, stars: repository.stargazers_count }
+
+    WebhookConstructRule:
+      type: object
+      description: 构造规则：消息字段 → 含 `$键` 引用的模板。
+      properties:
+        title: { type: string, description: 标题模板，如 '⭐ 新 Star：$repo'。 }
+        description: { type: string, description: 描述模板。 }
+        content: { type: string, description: 内容模板（Markdown）。 }
+        url: { type: string, description: 跳转链接模板。 }
+      example: { title: '⭐ 新 Star：$repo', description: '$sender 给 $repo 点了 star（共 $stars）', content: '', url: '' }
+
+    WebhookTriggerPayload:
+      type: object
+      description: 外部触发的任意 JSON 请求体（供提取规则按 JSON 路径取值）。
+      additionalProperties: true
+      example:
+        action: starred
+        repository: { full_name: hope/nectarpush, stargazers_count: 128 }
+        sender: { login: someone }
+
+    Option:
+      type: object
+      description: 系统设置项。
+      properties:
+        key: { type: string, description: 设置键（如 SystemName/SMTPServer/OAuth2Providers/Notice…）。 }
+        value: { type: string, description: 值（敏感项不回显，返回空串并以 configured 标记）。 }
+        sensitive: { type: boolean, description: 是否敏感项（键名含 Token/Secret/Password）。 }
+        configured: { type: boolean, description: 敏感项是否已配置（非敏感项缺省 true）。 }
+      required: [key, value, sensitive]
+      example: { key: SMTPToken, value: '', sensitive: true, configured: true }
+
+    # ---------- 通道类型清单 ----------
+
+    ConfigFieldType:
+      type: string
+      description: 动态表单控件类型。
+      enum: [string, password, number, boolean, select, multiselect, textarea]
+      example: password
+
+    ConfigField:
+      type: object
+      description: 动态表单字段描述（前端按此渲染输入控件）。
+      properties:
+        key: { type: string, description: 配置键（存入 channel.config）。 }
+        label: { type: string, description: 中文标签。 }
+        type: { $ref: '#/components/schemas/ConfigFieldType' }
+        required: { type: boolean, default: false }
+        secret: { type: boolean, description: 敏感字段（密码框 + 不返回明文 + 写入数据库前加密）。 }
+        placeholder: { type: [string, 'null'] }
+        help: { type: [string, 'null'], description: 辅助说明。 }
+        default: { type: [string, 'null'] }
+        options:
+          type: [array, 'null']
+          description: select/multiselect 的可选值。
+          items: { type: string }
+          example: [plugin, app]
+      required: [key, label, type, required, secret]
+      example: { key: secret, label: Bot Token, type: password, required: true, secret: true, placeholder: '123456:AAH…' }
+
+    ChannelConfigSchema:
+      type: object
+      description: 该通道类型的配置表单 schema（fields 数组驱动动态表单；type=none 时 fields 为空数组）。
+      properties:
+        fields:
+          type: array
+          items: { $ref: '#/components/schemas/ConfigField' }
+      required: [fields]
+      example:
+        fields:
+          - { key: secret, label: Bot Token, type: password, required: true, secret: true }
+          - { key: account_id, label: Chat ID, type: string, required: true, secret: false }
+
+    ChannelCapabilities:
+      type: object
+      description: 通道能力标记（驱动前端字段显隐与 to 文案；group 继承子通道）。
+      properties:
+        title: { type: boolean }
+        description: { type: boolean }
+        content: { type: boolean }
+        url: { type: boolean }
+        to: { type: boolean }
+        markdown: { type: boolean }
+        to_mode:
+          type: string
+          description: to 字段语义：recipient=收件人 / @mention=@成员 / chat=会话目标 / none=无 to。
+          enum: [recipient, '@mention', chat, none]
+      required: [title, description, content, url, to, markdown, to_mode]
+      example: { title: true, description: true, content: true, url: true, to: true, markdown: true, to_mode: '@mention' }
+
+    ChannelTypeDescriptor:
+      type: object
+      description: 通道类型描述（清单条目）。
+      properties:
+        type: { $ref: '#/components/schemas/ChannelType' }
+        display_name: { type: string, description: 中文名。 }
+        status: { type: string, enum: [core, draft], description: core=完整实现；draft=占位（还没接入真实服务）。 }
+        capabilities: { $ref: '#/components/schemas/ChannelCapabilities' }
+        config_schema: { $ref: '#/components/schemas/ChannelConfigSchema' }
+      required: [type, display_name, status, capabilities, config_schema]
+      example:
+        type: telegram
+        display_name: Telegram
+        status: core
+        capabilities: { title: false, description: true, content: true, url: false, to: true, markdown: false, to_mode: chat }
+        config_schema:
+          fields:
+            - { key: secret, label: Bot Token, type: password, required: true, secret: true }
+            - { key: account_id, label: Chat ID, type: string, required: true, secret: false }
+
+    # ---------- 请求体 ----------
+
+    PushRequestBody:
+      type: object
+      description: 推送请求字段（GET 等价 query；别名 short/desp/openid 亦支持）。
+      properties:
+        title: { type: string, maxLength: 512 }
+        description: { type: string }
+        short: { type: string, description: description 兼容别名。 }
+        content: { type: string }
+        desp: { type: string, description: content 兼容别名。 }
+        url: { type: string, format: uri }
+        channel: { type: string, maxLength: 20 }
+        token: { type: string, description: 推送令牌（两种令牌的说明见端点）。 }
+        to: { type: string, maxLength: 256, description: '通道选择器（@all / a|b / 通道名）；目标通道为 email 且值为邮箱地址时作为收件人（发他人须授权）。' }
+        openid: { type: string, description: to 兼容别名。 }
+        async: { type: string, enum: ['true', 'false'], description: '"true" 时异步。' }
+        render_mode: { $ref: '#/components/schemas/RenderMode' }
+      example: { title: 构建失败, description: main 分支构建失败, channel: ding, token: d1c0ffee1234567890abcdef12345678, to: '@all', async: 'true' }
+
+    ConsoleSendRequest:
+      type: object
+      required: [channel]
+      properties:
+        channel: { type: string, maxLength: 20, description: 目标通道名。 }
+        title: { type: string, maxLength: 512 }
+        description: { type: string }
+        content: { type: string }
+        url: { type: string, format: uri }
+        to: { type: string, maxLength: 256 }
+        render_mode: { $ref: '#/components/schemas/RenderMode' }
+        async: { type: boolean, default: false }
+      example: { channel: my-tg, title: 构建失败, content: '# 日志\nexit 1', to: '@all', render_mode: markdown, async: false }
+
+    RegisterRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, maxLength: 12 }
+        password: { type: string, minLength: 8, maxLength: 20 }
+        display_name: { type: string, maxLength: 20 }
+        email: { type: string, format: email, maxLength: 50 }
+        verification_code: { type: string, description: 开启邮箱验证时必填。 }
+        turnstile_token: { type: string, description: 开启 Turnstile 时必填。 }
+      example: { username: hope, password: 'h0pe!pass42', display_name: Hope, email: hope@example.com, verification_code: '884213' }
+
+    LoginRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, maxLength: 12 }
+        password: { type: string, minLength: 8, maxLength: 20 }
+      example: { username: hope, password: 'h0pe!pass42' }
+
+    EmailOnlyRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email, maxLength: 50 }
+        turnstile_token: { type: string }
+      example: { email: hope@example.com }
+
+    ResetConfirmRequest:
+      type: object
+      required: [email, token, new_password, new_password_confirm]
+      properties:
+        email: { type: string, format: email }
+        token: { type: string, description: 重置邮件中的一次性令牌。 }
+        new_password: { type: string, minLength: 8, maxLength: 20, description: 用户自设的新密码（强度对齐注册）。 }
+        new_password_confirm: { type: string, minLength: 8, maxLength: 20, description: 确认新密码，须与 new_password 一致。 }
+      example: { email: hope@example.com, token: 5c1f9a77b2e34d08, new_password: my-new-pass-42, new_password_confirm: my-new-pass-42 }
+
+    ChannelUpsertRequest:
+      type: object
+      required: [type, name]
+      properties:
+        type: { $ref: '#/components/schemas/ChannelType' }
+        name: { type: string, minLength: 1, maxLength: 20, description: 不可为保留名 email。 }
+        description: { type: string, maxLength: 100 }
+        enabled: { type: boolean, default: true }
+        config: { $ref: '#/components/schemas/ChannelConfigInput' }
+        token: { type: [string, 'null'], description: 可选通道级推送令牌。 }
+      example: { type: telegram, name: my-tg, config: { secret: '7312345678:AAH...', account_id: '123456789' } }
+
+    ChannelUpdateRequest:
+      type: object
+      properties:
+        status_only: { type: boolean, default: false, description: true 时仅更新 enabled。 }
+        name: { type: string, minLength: 1, maxLength: 20 }
+        description: { type: string, maxLength: 100 }
+        enabled: { type: boolean }
+        config: { $ref: '#/components/schemas/ChannelConfigInput' }
+        token: { type: [string, 'null'] }
+      example: { status_only: false, enabled: true, config: { account_id: '987654321' } }
+
+    ChannelTestRequest:
+      type: object
+      properties:
+        to: { type: string, maxLength: 256, description: 可选测试目标；缺省用通道默认目标；email 可临时指定收件人。 }
+      example: { to: someone@example.com }
+
+    WebhookUpsertRequest:
+      type: object
+      required: [name, target_channel, extract_rule, construct_rule]
+      properties:
+        name: { type: string, minLength: 1, maxLength: 20 }
+        target_channel: { type: string, maxLength: 20 }
+        enabled: { type: boolean, default: true }
+        extract_rule: { $ref: '#/components/schemas/WebhookExtractRule' }
+        construct_rule: { $ref: '#/components/schemas/WebhookConstructRule' }
+      example:
+        name: gh-star
+        target_channel: my-ding
+        extract_rule: { repo: repository.full_name, sender: sender.login }
+        construct_rule: { title: '⭐ $repo', description: '$sender star 了 $repo' }
+
+    WebhookUpdateRequest:
+      type: object
+      properties:
+        status_only: { type: boolean, default: false }
+        name: { type: string, minLength: 1, maxLength: 20 }
+        target_channel: { type: string, maxLength: 20 }
+        enabled: { type: boolean }
+        extract_rule: { $ref: '#/components/schemas/WebhookExtractRule' }
+        construct_rule: { $ref: '#/components/schemas/WebhookConstructRule' }
+      example: { status_only: true, enabled: false }
+
+    UserCreateRequest:
+      type: object
+      required: [username, password]
+      properties:
+        username: { type: string, maxLength: 12 }
+        password: { type: string, minLength: 8, maxLength: 20 }
+        display_name: { type: string, maxLength: 20 }
+        role: { $ref: '#/components/schemas/UserRole' , description: 不可创建 ≥ 自身权限者。 }
+      example: { username: alice, password: 'alice!pass99', display_name: Alice, role: user }
+
+    UserUpdateRequest:
+      type: object
+      description: 允许修改：username / display_name / password。
+      properties:
+        username: { type: string, maxLength: 12 }
+        display_name: { type: string, maxLength: 20 }
+        password: { type: string, minLength: 8, maxLength: 20 }
+      example: { display_name: Alice2, password: 'new!pass123' }
+
+    UserManageAction:
+      type: string
+      enum: [enable, disable, promote, demote, allow_send_email_to_others, disallow_send_email_to_others, allow_save_message, disallow_save_message]
+      example: allow_save_message
+
+    UserManageRequest:
+      type: object
+      required: [action]
+      properties:
+        action: { $ref: '#/components/schemas/UserManageAction' }
+      example: { action: allow_save_message }
+
+    UserRestoreRequest:
+      type: object
+      description: 恢复软删用户。username 可选：缺省沿用存储名（deleted_{id}，被占用时服务端自动生成 restored_{id}_{n}）。
+      properties:
+        username: { type: string, minLength: 1, maxLength: 12, description: 恢复后使用的用户名；被占用返回 422 DUPLICATE_NAME。 }
+      example: { username: hope }
+
+    MessageUpdateRequest:
+      type: object
+      description: 编辑消息。字段可选，仅更新提供的字段；仅 status 为 pending/failed 的消息可编辑。
+      properties:
+        title: { type: string, maxLength: 512 }
+        description: { type: string }
+        content: { type: string }
+        url: { type: string, format: uri }
+        render_mode: { $ref: '#/components/schemas/RenderMode' }
+      example: { title: '部署完成（更新）', content: '# 修订后的日志' }
+
+    OptionUpdateRequest:
+      type: object
+      required: [key, value]
+      properties:
+        key: { type: string, maxLength: 64 }
+        value: { type: string, description: 值一律字符串（布尔/JSON 序列化后存）。 }
+      example: { key: Notice, value: '欢迎使用蜂鸟推送' }
+
+    MeUpdateRequest:
+      type: object
+      description: |
+        允许修改的字段。改密码需带 old_password（OAuth 首次设置密码可省略）；修改邮箱时若已配置
+        SMTP，须先调用 `/api/me/email/verification` 并携带 email_code；未配置 SMTP 可直接保存，
+        但该邮箱暂时无法用于找回密码。邮箱传空串或 null 表示清除绑定并停用 email 通道。
+      properties:
+        username: { type: string, maxLength: 12 }
+        display_name: { type: string, maxLength: 20 }
+        old_password: { type: string, description: 修改密码时必填（账号已有密码时）。 }
+        password: { type: string, minLength: 8, maxLength: 20 }
+        default_channel: { type: [string, 'null'], maxLength: 20 }
+        email: { type: [string, 'null'], format: email, maxLength: 254, description: 新邮箱；空串/null 清除。 }
+        email_code: { type: string, minLength: 6, maxLength: 6, description: 已配置 SMTP 时必填的 6 位验证码。 }
+      example: { display_name: Hope2, email: hope@example.com, email_code: '482913' }
+
+    PushSettingsUpdateRequest:
+      type: object
+      properties:
+        default_channel: { type: [string, 'null'], maxLength: 20 }
+      example: { default_channel: my-ding }
+
+    # ---------- 结果响应格式（Result&lt;T&gt; 具体化） ----------
+
+    PushResultData:
+      type: object
+      properties:
+        uuid: { type: string, minLength: 4, maxLength: 32, description: 消息 uuid；未持久化时为 "unsaved"。 }
+      required: [uuid]
+      example: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c }
+
+    PushResultEnvelope:
+      type: object
+      description: 推送结果响应格式（success 表示业务成败）。
+      properties:
+        success: { type: boolean }
+        message: { type: string, description: 失败原因或空串。 }
+        data: { $ref: '#/components/schemas/PushResultData' }
+      required: [success, message]
+      example: { success: true, message: '', data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c } }
+
+    SendResultData:
+      type: object
+      properties:
+        uuid: { type: string }
+        status: { $ref: '#/components/schemas/MessageStatus' }
+      required: [uuid, status]
+      example: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, status: success }
+
+    SendResultEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/SendResultData' }
+      required: [success, data]
+      example: { success: true, message: 发送成功, data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, status: success } }
+
+    LoginResultData:
+      type: object
+      properties:
+        user: { $ref: '#/components/schemas/User' }
+        must_change_password: { type: boolean, description: root 首次登录或重置密码后必须改密（未改密前服务端拦截）。 }
+      required: [user, must_change_password]
+      example:
+        user: { id: 1, username: root, display_name: root, role: root, status: active, email: null, default_channel: null, permissions: { send_email_to_others: true, save_message: true }, created_at: '2026-11-01T00:00:00Z' }
+        must_change_password: true
+
+    LoginResultEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/LoginResultData' }
+      required: [success, data]
+      example:
+        success: true
+        data:
+          user: { id: 1, username: root, display_name: root, role: root, status: active, email: null, default_channel: null, permissions: { send_email_to_others: true, save_message: true }, created_at: '2026-11-01T00:00:00Z' }
+          must_change_password: true
+
+    ResetConfirmResultEnvelope:
+      type: object
+      description: 重置成功信封；不含 data，绝不返回明文密码。
+      properties:
+        success: { type: boolean, const: true }
+        message: { type: string }
+      required: [success, message]
+      example: { success: true, message: 密码已重置 }
+
+    TokenResultData:
+      type: object
+      properties:
+        token: { type: string, description: 新全局令牌（去掉连字符的 UUID；仅本次完整返回）。 }
+      required: [token]
+      example: { token: e5f60718293a4b5c6d7e8f9a0b1c2d34 }
+
+    TokenResultEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/TokenResultData' }
+      required: [success, data]
+      example: { success: true, message: 令牌已生成, data: { token: e5f60718293a4b5c6d7e8f9a0b1c2d34 } }
+
+    ChannelTestResultData:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string, description: 结果摘要（成功/失败原因）。 }
+        latency_ms: { type: [integer, 'null'] }
+        raw: { type: [string, 'null'], description: 上游原始响应（排障用）。 }
+      required: [success, message]
+      example: { success: true, message: 发送成功, latency_ms: 342, raw: 'telegram sendMessage ok' }
+
+    ChannelTestResultEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        data: { $ref: '#/components/schemas/ChannelTestResultData' }
+      required: [success, data]
+      example:
+        success: true
+        data: { success: true, message: 发送成功, latency_ms: 342, raw: 'telegram sendMessage ok' }
+
+    MessageStatusData:
+      type: object
+      properties:
+        uuid: { type: string }
+        status: { $ref: '#/components/schemas/MessageStatus' }
+      required: [uuid, status]
+      example: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, status: success }
+
+    MessageStatusEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/MessageStatusData' }
+      required: [success, data]
+      example: { success: true, message: '', data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, status: success } }
+
+    # ---------- 列表/分页响应格式 ----------
+
+    ChannelListData:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Channel' }
+        page: { $ref: '#/components/schemas/PageMeta' }
+      required: [items, page]
+
+    ChannelListEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/ChannelListData' }
+      required: [success, data]
+
+    ChannelCreated:
+      allOf:
+        - $ref: '#/components/schemas/Channel'
+        - type: object
+          properties:
+            access_token: { type: [string, 'null'], description: 通道级令牌明文；仅创建响应返回一次（未设置时为 null）。 }
+      description: 创建通道的响应视图（在 Channel 基础上多一次性 access_token）。
+      example: { id: 1, name: my-tg, type: telegram, enabled: true, config: { secret: '******', account_id: '123456789' }, created_at: '2026-11-02T10:00:00Z', access_token: null }
+
+    ChannelCreatedEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/ChannelCreated' }
+      required: [success, data]
+
+    ChannelTokenRequest:
+      type: object
+      properties:
+        token: { type: [string, 'null'], maxLength: 128, description: 可选的自定义令牌；省略则服务端生成 32 位十六进制值。 }
+      example: { token: optional-custom-channel-token }
+
+    ChannelTokenData:
+      type: object
+      properties:
+        access_token: { type: string, description: 通道级令牌明文，仅本次返回。 }
+      required: [access_token]
+      example: { access_token: 6f1c0f9a2b3d4e5f60718293a4b5c6d7 }
+
+    ChannelTokenEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/ChannelTokenData' }
+      required: [success, data]
+
+    ChannelEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/Channel' }
+      required: [success, data]
+
+    ChannelTypeListData:
+      type: object
+      properties:
+        items:
+          type: array
+          description: 全部 16 类通道类型描述。
+          items: { $ref: '#/components/schemas/ChannelTypeDescriptor' }
+        total: { type: integer, const: 16 }
+      required: [items, total]
+
+    ChannelTypeListEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/ChannelTypeListData' }
+      required: [success, data]
+
+    MessagePageData:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/MessageSummary' }
+        page: { $ref: '#/components/schemas/PageMeta' }
+      required: [items, page]
+
+    MessagePageEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/MessagePageData' }
+      required: [success, data]
+
+    MessageDetailEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/MessageDetail' }
+      required: [success, data]
+
+    PublicMessageDetailEnvelope:
+      type: object
+      description: 公开消息正文响应格式（GET /api/messages/{uuid}）。
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/PublicMessageDetail' }
+      required: [success, data]
+      example:
+        success: true
+        data: { uuid: 9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c, title: 部署完成, description: null, content: '# 详情…', url: 'https://example.com/log', render_mode: markdown, status: success, created_at: '2026-11-08T14:03:22Z' }
+
+    WebhookListData:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Webhook' }
+        page: { $ref: '#/components/schemas/PageMeta' }
+      required: [items, page]
+
+    WebhookListEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/WebhookListData' }
+      required: [success, data]
+
+    WebhookEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/Webhook' }
+      required: [success, data]
+
+    UserPageData:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/User' }
+        page: { $ref: '#/components/schemas/PageMeta' }
+      required: [items, page]
+
+    UserPageEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/UserPageData' }
+      required: [success, data]
+
+    UserEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/User' }
+      required: [success, data]
+
+    OptionListData:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/Option' }
+      required: [items]
+
+    OptionListEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/OptionListData' }
+      required: [success, data]
+
+    PushSettingsData:
+      type: object
+      properties:
+        username: { type: string }
+        default_channel: { type: [string, 'null'] }
+        token_masked: { type: [string, 'null'], description: 令牌掩码（如 e5f6••••d34）；未生成为 null。 }
+        push_endpoint: { type: string, format: uri }
+        examples:
+          type: object
+          description: 可复制的调用示例（key 为语言/工具名，value 为命令文本）。
+          additionalProperties: { type: string }
+          example: { curl: "curl -X POST 'https://push.example.com/push/hope' -H 'Content-Type: application/json' -d '{\"title\":\"Hi\",\"token\":\"<你的令牌>\"}'" }
+      required: [username, push_endpoint]
+
+    PushSettingsEnvelope:
+      type: object
+      properties:
+        success: { type: boolean }
+        message: { type: string }
+        data: { $ref: '#/components/schemas/PushSettingsData' }
+      required: [success, data]
+
+    TextContentData:
+      type: object
+      properties:
+        content: { type: string, description: 文本（Markdown，空内容为空串）。 }
+      required: [content]
+      example: { content: '系统将于周日晚维护。' }
+
+    TextContentEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/TextContentData' }
+      required: [success, data]
+
+    HealthData:
+      type: object
+      properties:
+        status: { type: string, enum: [ok, degraded] }
+        uptime_seconds: { type: integer }
+        database: { type: string, enum: [ok, degraded] }
+      required: [status, uptime_seconds, database]
+      example: { status: ok, uptime_seconds: 86400, database: ok }
+
+    HealthEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/HealthData' }
+      required: [success, data]
+
+    TurnstileSiteKeyData:
+      type: object
+      description: Turnstile 前端引导信息。enabled=false 时前端不渲染验证组件；SecretKey 不会出现在响应中。
+      properties:
+        enabled: { type: boolean, description: TurnstileCheckEnabled 开关。 }
+        site_key: { type: string, description: 站点密钥；未配置时为空串。 }
+      required: [enabled, site_key]
+      example: { enabled: true, site_key: 0x4AAAAAAA1234567890 }
+
+    TurnstileSiteKeyEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/TurnstileSiteKeyData' }
+      required: [success, data]
+
+    VersionData:
+      type: object
+      properties:
+        version: { type: string }
+        commit: { type: [string, 'null'], description: 构建提交哈希。 }
+      required: [version]
+      example: { version: 1.0.0, commit: a1b2c3d }
+
+    VersionEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/VersionData' }
+      required: [success, data]
+
+    OAuthProviderSummary:
+      type: object
+      properties:
+        id: { type: string, maxLength: 32 }
+        display_name: { type: string, maxLength: 64 }
+      required: [id, display_name]
+
+    OAuthProviderListData:
+      type: object
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/OAuthProviderSummary' }
+      required: [items]
+
+    OAuthProviderListEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/OAuthProviderListData' }
+      required: [success, data]
+
+    OAuthDiscoveryRequest:
+      type: object
+      required: [url]
+      properties:
+        url: { type: string, maxLength: 2048, description: issuer 或完整 discovery URL。 }
+      example: { url: 'https://sso.example.com/.well-known/openid-configuration' }
+
+    OAuthDiscoveryData:
+      type: object
+      properties:
+        issuer: { type: [string, 'null'] }
+        authorize_url: { type: string, format: uri }
+        token_url: { type: string, format: uri }
+        userinfo_url:
+          type: string
+          description: 文档未提供时为空串，前端提示手动填写。
+        scope: { type: string }
+        map_username: { type: string }
+        map_email: { type: string }
+        scopes_supported:
+          type: array
+          items: { type: string }
+        warnings:
+          type: array
+          items: { type: string }
+      required: [authorize_url, token_url, userinfo_url, scope, map_username, map_email, scopes_supported, warnings]
+
+    OAuthDiscoveryEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/OAuthDiscoveryData' }
+      required: [success, data]
+
+    OAuthBoundProvider:
+      type: object
+      properties:
+        provider: { type: string }
+        display_name: { type: string }
+        oauth_id: { type: string }
+      required: [provider, display_name, oauth_id]
+
+    MeSecurityData:
+      type: object
+      properties:
+        has_password: { type: boolean, description: false 表示 OAuth 自动建号、尚未设置密码。 }
+        email_verification_enabled: { type: boolean, description: 仅控制注册验证码；不影响已配置 SMTP 时的邮箱变更。 }
+        email_change_requires_code: { type: boolean, description: 已配置 SMTP 时为 true，修改邮箱必须携带邮箱验证码。 }
+        oauth:
+          type: object
+          description: 多绑：bindings 为当前用户全部第三方绑定（按绑定先后排序），可为空数组。
+          properties:
+            bindings:
+              type: array
+              items: { $ref: '#/components/schemas/OAuthBoundProvider' }
+            providers:
+              type: array
+              items: { $ref: '#/components/schemas/OAuthProviderSummary' }
+          required: [bindings, providers]
+      required: [has_password, email_verification_enabled, email_change_requires_code, oauth]
+
+    MeSecurityEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/MeSecurityData' }
+      required: [success, data]
+
+    EmailChangeRequest:
+      type: object
+      required: [email]
+      properties:
+        email: { type: string, format: email, maxLength: 254 }
+      example: { email: new@example.com }
+
+    EmailChangeData:
+      type: object
+      properties:
+        sent: { type: boolean }
+        required: { type: boolean }
+        message: { type: string }
+      required: [sent, required, message]
+
+    EmailChangeEnvelope:
+      type: object
+      properties:
+        success: { type: boolean, const: true }
+        data: { $ref: '#/components/schemas/EmailChangeData' }
+      required: [success, data]
