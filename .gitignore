@@ -1,0 +1,41 @@
+# ---- Dependencies ----
+node_modules/
+.pnpm-store/
+
+# ---- Build output ----
+dist/
+apps/*/dist/
+*.tsbuildinfo
+
+# ---- Runtime data / local databases ----
+*.db
+backups/
+*.db-journal
+apps/api/data/
+apps/api/prisma/data/
+
+# ---- Environment files (secrets) ----
+.env
+.env.*
+!.env.example
+
+# ---- Excluded project folders ----
+# docs/ is version-controlled (product docs, contract, design, audit evidence).
+prompt-kit/
+
+# ---- OS / editor / tooling ----
+.DS_Store
+*.log
+.figma/
+.trash/
+
+# ---- Test artifacts ----
+test-results/
+playwright-report/
+blob-report/
+.playwright/
+.hypothesis/
+.schemathesis/
+
+# ---- Docker bind-mounted runtime data ----
+deploy/data/
