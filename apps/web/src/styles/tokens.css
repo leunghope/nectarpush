@@ -1,0 +1,117 @@
+/* NectarPush S3 · Direction 02 — Quiet Precision
+   Warm paper neutrals, ink actions, single mineral-teal signal. */
+:root {
+  color-scheme: light;
+
+  --paper: #f3f1eb;
+  --surface: #f8f7f2;
+  --raised: #fffefb;
+  --muted: #ece9e0;
+  --hover: #f1eee7;
+
+  --ink: #1b1c19;
+  --ink-2: #55554e;
+  --ink-3: #8b897f;
+  --ink-4: #aaa79d;
+
+  --line: #e2ded3;
+  --line-strong: #cec8ba;
+
+  --accent: #0f8d7d;
+  --accent-strong: #0a7467;
+  --accent-ink: #075b51;
+  --accent-soft: #e5f2ee;
+  --accent-wash: #f2f7f4;
+
+  --action-bg: #1b1c19;
+  --action-fg: #fffefb;
+  --action-hover: #33342f;
+
+  --danger: #a2473f;
+  --danger-soft: #f6e9e6;
+  --success: #35714f;
+  --warning: #876326;
+  --info: #405d82;
+  --sse: #0f8d7d;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue",
+    "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-serif: "Songti SC", "STSong", "Iowan Old Style", "Palatino Linotype", Georgia, serif;
+  --font-mono: "SF Mono", ui-monospace, Menlo, Consolas, "Liberation Mono", monospace;
+
+  --fs-2xs: 10px;
+  --fs-xs: 11px;
+  --fs-sm: 12.5px;
+  --fs-base: 14px;
+  --fs-md: 15px;
+  --fs-lg: 17px;
+  --fs-xl: 22px;
+  --fs-2xl: 28px;
+  --fs-display: 56px;
+
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 28px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+
+  --radius-xs: 5px;
+  --radius-sm: 7px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --radius-xl: 20px;
+  --radius-full: 999px;
+
+  --shadow-xs: 0 1px 1px rgba(27, 28, 25, 0.03), 0 1px 2px rgba(27, 28, 25, 0.04);
+  --shadow-sm: 0 2px 8px rgba(27, 28, 25, 0.05);
+
+  --rail-width: 236px;
+  --topbar-height: 58px;
+  --content-max: 1200px;
+  --control-height: 38px;
+  --touch-height: 44px;
+}
+
+html[data-theme="dark"] {
+  color-scheme: dark;
+
+  --paper: #161613;
+  --surface: #1c1c18;
+  --raised: #22221d;
+  --muted: #272720;
+  --hover: #2b2b24;
+
+  --ink: #f0ede5;
+  --ink-2: #bdbab0;
+  --ink-3: #858177;
+  --ink-4: #69665f;
+
+  --line: #302f29;
+  --line-strong: #48463d;
+
+  --accent: #4ac7b4;
+  --accent-strong: #37a897;
+  --accent-ink: #8ae1d2;
+  --accent-soft: #1d3733;
+  --accent-wash: #1a2926;
+
+  --action-bg: #efede6;
+  --action-fg: #181815;
+  --action-hover: #d8d5ca;
+
+  --danger: #de8b81;
+  --danger-soft: #3a2421;
+  --success: #7db893;
+  --warning: #c6a25b;
+  --info: #8cabd0;
+  --sse: #4ac7b4;
+
+  --shadow-xs: 0 1px 1px rgba(0, 0, 0, 0.12), 0 1px 2px rgba(0, 0, 0, 0.16);
+  --shadow-sm: 0 4px 14px rgba(0, 0, 0, 0.22);
+}

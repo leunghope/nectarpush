@@ -1,0 +1,27 @@
+services:
+  nectarpush:
+    # 想直接拉取预构建镜像（不本地构建）：docker compose pull && docker compose up -d --no-build
+    # 想固定版本：在 .env 里设 NECTARPUSH_VERSION=0.2.0
+    image: ghcr.io/leunghope/nectarpush:${NECTARPUSH_VERSION:-latest}
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        APP_VERSION: ${APP_VERSION:-}
+        GIT_COMMIT: ${GIT_COMMIT:-}
+    container_name: nectarpush
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-file:/data/nectarpush.db}
+      SESSION_SECRET: ${SESSION_SECRET:?请在 .env 或环境中设置 SESSION_SECRET（>=32 字符随机串）}
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      COOKIE_SECURE: ${COOKIE_SECURE:-}
+      TRUST_PROXY: ${TRUST_PROXY:-}
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # 数据落在宿主机目录，Docker Desktop 重置/升级不会丢库；目录已在 .gitignore。
+      - ./data:/data
+    restart: unless-stopped
