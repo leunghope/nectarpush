@@ -1,0 +1,178 @@
+### NectarPush REST Client 示例（VS Code REST Client / JetBrains HTTP Client）
+### 用法：把 {{$host}} 换成你的部署地址；登录请求会自动保存 Cookie。
+
+@host = https://push.example.com
+@username = hope
+@pushToken = e5f60718293a4b5c6d7e8f9a0b1c2d34
+
+### 登录（保存会话 Cookie）
+# @name login
+POST {{host}}/api/auth/login
+Content-Type: application/json
+
+{"username": "hope", "password": "h0pe!pass42"}
+
+### 注册
+POST {{host}}/api/auth/register
+Content-Type: application/json
+
+{"username": "newuser", "password": "s0me!pass88", "password2": "s0me!pass88"}
+
+### 登出
+POST {{host}}/api/auth/logout
+
+### 通道类型清单（驱动动态表单）
+GET {{host}}/api/channels/types
+
+### 我的通道列表
+GET {{host}}/api/channels
+
+### 新建 Telegram 通道
+POST {{host}}/api/channels
+Content-Type: application/json
+
+{
+  "name": "my-tg",
+  "type": "telegram",
+  "config": {"secret": "123456:ABC-DEF...", "account_id": "-1001234567890"}
+}
+
+### 新建自定义通道（JSON 模板）
+POST {{host}}/api/channels
+Content-Type: application/json
+
+{
+  "name": "my-custom",
+  "type": "custom",
+  "config": {
+    "url": "https://example.com/hook",
+    "other": "{\"text\": \"$title $description\", \"body\": \"$content\"}"
+  }
+}
+
+### 通道详情（敏感字段返回 ******）
+GET {{host}}/api/channels/42
+
+### 仅切换通道启用状态
+PATCH {{host}}/api/channels/42?status_only=true
+Content-Type: application/json
+
+{"enabled": true}
+
+### 测试通道发送
+POST {{host}}/api/channels/42/test
+Content-Type: application/json
+
+{}
+
+### 推送：GET（Server酱 风格）
+GET {{host}}/push/{{username}}?title=部署完成&description=服务已重启&to=@all&token={{pushToken}}
+
+### 推送：POST JSON + Bearer
+POST {{host}}/push/{{username}}
+Authorization: Bearer {{pushToken}}
+Content-Type: application/json
+
+{
+  "title": "构建失败",
+  "content": "# 构建日志\n```text\nexit 1\n```",
+  "channel": "my-tg",
+  "to": "@all",
+  "render_mode": "markdown"
+}
+
+### 推送：异步 + 状态轮询
+POST {{host}}/push/{{username}}?async=true&token={{pushToken}}
+Content-Type: application/json
+
+{"title": "备份", "description": "db dump ok", "async": "true"}
+
+### 查询异步状态（公开）
+GET {{host}}/api/messages/9f8b2a1c7d6e4f0a3b2c1d0e9f8a7b6c/status
+
+### 消息列表（分页 + 筛选）
+GET {{host}}/api/messages?page=1&page_size=10&status=failed&channel=my-tg
+
+### 消息详情（含投递明细）
+GET {{host}}/api/messages/1024
+
+### 重发
+POST {{host}}/api/messages/1024/resend
+
+### 删除单条消息
+DELETE {{host}}/api/messages/1024
+
+### Webhook 列表
+GET {{host}}/api/webhooks
+
+### 新建 Webhook（服务端生成 32 位 link）
+POST {{host}}/api/webhooks
+Content-Type: application/json
+
+{
+  "name": "github-star",
+  "status": 1,
+  "channel": "my-tg",
+  "extract_rule": {
+    "repo": "repository.full_name",
+    "stars": "repository.stargazers_count",
+    "who": "sender.login"
+  },
+  "construct_rule": {
+    "title": "$who star 了 $repo",
+    "description": "当前 $stars 星"
+  }
+}
+
+### 外部触发 Webhook（免令牌，name 即 32 位 link）
+POST {{host}}/webhook/7c9f1d2e3b4a5f60718293a4b5c6d7e8
+Content-Type: application/json
+
+{
+  "action": "starred",
+  "repository": {"full_name": "hope/nectarpush", "stargazers_count": 128},
+  "sender": {"login": "someone"}
+}
+
+### 当前用户信息
+GET {{host}}/api/me
+
+### 修改资料（改密需 old_password）
+PATCH {{host}}/api/me
+Content-Type: application/json
+
+{"display_name": "Hope", "old_password": "h0pe!pass42", "password": "n3w!pass99"}
+
+### 生成/重置全局推送令牌（仅本次完整返回）
+POST {{host}}/api/me/token
+
+### 我的推送设置
+GET {{host}}/api/me/push
+
+### 系统设置（root）
+GET {{host}}/api/options
+
+### 更新单个设置项（root）
+PATCH {{host}}/api/options
+Content-Type: application/json
+
+{"key": "SystemName", "value": "蜂鸟推送"}
+
+### 用户管理（admin）
+GET {{host}}/api/users?page=1&page_size=10&keyword=hop
+
+### 管理动作：禁用用户
+POST {{host}}/api/users/7/manage
+Content-Type: application/json
+
+{"action": "disable"}
+
+### 公开信息
+GET {{host}}/api/public/about
+###
+GET {{host}}/api/health
+###
+GET {{host}}/api/version
+
+### SSE 订阅（浏览器 EventSource；编辑器里不会显示流）
+# new EventSource("{{host}}/api/events")

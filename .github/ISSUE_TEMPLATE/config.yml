@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞
+    url: https://github.com/leunghope/nectarpush/security/advisories/new
+    about: 请通过私密漏洞报告渠道提交，不要创建公开 Issue。
+  - name: 使用问题与讨论
+    url: https://github.com/leunghope/nectarpush/discussions
+    about: 使用疑问、部署求助与想法交流请前往 Discussions。

@@ -1,0 +1,139 @@
+generator client {
+  provider = "prisma-client-js"
+  // 只声明 native：镜像按目标架构原生构建（CI 用 amd64 / arm64 runner 各自构建），
+  // 写死 cross target 会让每份镜像多带一个用不上的引擎（实测 33.5MB）。
+  binaryTargets = ["native"]
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id                     Int       @id @default(autoincrement())
+  username               String    @unique
+  displayName            String
+  passwordHash           String?
+  role                   String    @default("user") // user | admin | root
+  status                 String    @default("active") // active | disabled
+  email                  String?   @unique
+  defaultChannel         String?
+  accessToken            String? // global push token (encrypted)
+  mustChangePassword     Boolean   @default(false)
+  allowSendEmailToOthers Boolean   @default(false)
+  allowSaveMessage       Boolean   @default(true)
+  sessionsRevokedAt      DateTime? // sessions issued before this instant are invalid
+  deletedAt              DateTime?
+  createdAt              DateTime  @default(now())
+
+  channels      Channel[]
+  messages      Message[]
+  webhooks      Webhook[]
+  oauthBindings OAuthBinding[] // D-03 多绑：一用户可绑多个 OAuth 身份
+}
+
+// D-03：第三方账号绑定。同一 (provider, oauthId) 全局唯一，只能绑到一个用户；
+// 用户被硬删除时级联清理（软删除路径由服务层显式 deleteMany）。
+model OAuthBinding {
+  id        Int      @id @default(autoincrement())
+  userId    Int
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  provider  String
+  oauthId   String
+  createdAt DateTime @default(now())
+
+  @@unique([provider, oauthId])
+  @@index([userId])
+}
+
+model Channel {
+  id          Int      @id @default(autoincrement())
+  ownerId     Int
+  owner       User     @relation(fields: [ownerId], references: [id])
+  name        String
+  type        String
+  description String?
+  enabled     Boolean  @default(true)
+  config      String   @default("{}") // JSON; sensitive values AES-GCM encrypted
+  accessToken String? // channel-level push token (encrypted)
+  createdAt   DateTime @default(now())
+
+  deliveries MessageDelivery[]
+  messages   Message[]
+
+  @@unique([ownerId, name])
+  @@index([ownerId, type])
+}
+
+model Message {
+  id           Int      @id @default(autoincrement())
+  ownerId      Int
+  owner        User     @relation(fields: [ownerId], references: [id])
+  uuid         String   @unique
+  title        String?
+  description  String?
+  content      String?
+  url          String?
+  channelName  String
+  channelType  String
+  to           String?
+  renderMode   String   @default("markdown")
+  status       String   @default("pending")
+  channelId    Int?
+  channel      Channel? @relation(fields: [channelId], references: [id])
+  createdAt    DateTime @default(now())
+
+  deliveries MessageDelivery[]
+
+  @@index([ownerId, createdAt])
+  @@index([status])
+}
+
+model MessageDelivery {
+  id          Int      @id @default(autoincrement())
+  messageId   Int
+  message     Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  channelId   Int?
+  channel     Channel? @relation(fields: [channelId], references: [id])
+  channelName String
+  status      String   @default("pending") // pending | success | failed
+  latencyMs   Int?
+  error       String?
+  createdAt   DateTime @default(now())
+
+  @@index([messageId])
+}
+
+model Webhook {
+  id            Int      @id @default(autoincrement())
+  ownerId       Int
+  owner         User     @relation(fields: [ownerId], references: [id])
+  name          String
+  link          String   @unique // 32-char unpredictable trigger path
+  targetChannel String
+  enabled       Boolean  @default(true)
+  extractRule   String   @default("{}") // JSON: key -> json path
+  constructRule String   @default("{}") // JSON: message field -> template
+  createdAt     DateTime @default(now())
+
+  @@unique([ownerId, name])
+}
+
+model Option {
+  key   String @id
+  value String
+}
+
+model EmailCode {
+  id        Int      @id @default(autoincrement())
+  email     String
+  code      String
+  purpose   String // register | reset
+  token     String? // one-time reset token (purpose=reset)
+  used      Boolean  @default(false)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([email, purpose])
+}

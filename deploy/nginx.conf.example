@@ -1,0 +1,94 @@
+# NectarPush 反向代理 + TLS 示例配置
+#
+# 应用侧三个环境变量必须与本文件配套（deploy/docker-compose.yml 已透传）：
+#   PUBLIC_BASE_URL=https://push.example.com   绝对链接的唯一来源：OAuth 回调、
+#                                              密码重置链接、webhook 触发器地址
+#   TRUST_PROXY=true                           才允许 Fastify 采信 X-Forwarded-For
+#                                              （apps/api/src/main.ts:55），否则 req.ip
+#                                              永远是代理地址，所有人共用一个限流桶
+#   COOKIE_SECURE=true                         显式置 Secure；留空时由
+#                                              PUBLIC_BASE_URL 是否以 https:// 开头推导
+#                                              （apps/api/src/common/cookies.ts:10-14）
+#
+# 证书放在 /etc/letsencrypt/live/<域名>/ 只是示例路径，换成自己的即可。
+# 改完先 `nginx -t` 再 reload。
+#
+# 本文件是生产形态（80/443 + 公网域名）。本地演练用的是同一份配置，只改动了
+# listen / server_name / upstream / 证书路径四处（见 docs/qa-evidence/proxy-tls/）。
+
+upstream nectarpush_app {
+    # 单实例 Docker 部署时容器映射到 127.0.0.1:3000。
+    # 若 nginx 本身也跑在容器里，这里改成 host.docker.internal:3000 或容器名:3000。
+    server 127.0.0.1:3000;
+    keepalive 32;
+}
+
+# HTTP → HTTPS
+server {
+    listen 80;
+    server_name push.example.com;
+
+    # 301 而不是 302：域名一旦上 TLS 就不该再回退到明文。
+    # $request_uri 保留原始路径与查询串。
+    return 301 https://$host$request_uri;
+}
+
+server {
+    listen 443 ssl;
+    http2 on;
+    # nginx < 1.25 没有 `http2 on;` 指令，老版本请改用 `listen 443 ssl http2;`
+    server_name push.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/push.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/push.example.com/privkey.pem;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_session_cache   shared:SSL:10m;
+
+    # 全站切 HTTPS、证书稳定后再启用 HSTS（默认注释）。一旦下发，浏览器在
+    # max-age 内拒绝任何 http:// 回退，证书出问题会把用户锁在门外。
+    # add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+
+    # 与 apps/api/src/main.ts:58 的 bodyLimit（1 MB）对齐：代理层先于应用拒绝
+    # 超大请求，应用就不会收到被截断的 JSON。两处必须同步修改。
+    client_max_body_size 1m;
+
+    # SSE：GET /api/events（apps/api/src/realtime/sse-hub.ts:5，25 秒一次心跳）。
+    # 单列一个 location 是因为这里必须关缓冲：默认 proxy_buffering on 会把
+    # 心跳攒在 nginx 里，客户端看到的是"连接一直开着但没有任何数据"，
+    # 30 秒超时后心跳才随连接关闭一次性吐出——那就不叫 SSE 了。
+    location = /api/events {
+        proxy_pass http://nectarpush_app;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+
+        # 关键：用 $remote_addr 覆盖，绝不能用 $proxy_add_x_forwarded_for。
+        # 后者把客户端自带的 X-Forwarded-For 前置进链路；应用在
+        # TRUST_PROXY=true 下取 XFF 最左值当 req.ip（限流键，main.ts:81），
+        # 于是任何人都能每个请求换一个伪造 IP，把 20 次/20 分钟的登录限流
+        # 变成无限次。实测对照见 docs/qa-evidence/proxy-tls/（第 4 条）。
+        proxy_set_header X-Forwarded-For   $remote_addr;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # 关闭 hop-by-hop 的 Connection 头才能让上游保持长连接；
+        # 长连接 + 不缓冲是 SSE 不被攒住的两个前提。
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 3600s;
+    }
+
+    location / {
+        proxy_pass http://nectarpush_app;
+
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $remote_addr;   # 同上，必须覆盖
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_http_version 1.1;
+        proxy_set_header Connection "";
+        proxy_read_timeout 3600s;
+    }
+}
